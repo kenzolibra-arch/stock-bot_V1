@@ -1,33 +1,272 @@
-name: Stock Bot Runner
+# === V9.3 QUANT FUND GRADE ENGINE ===
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import ta
+import requests
+import os
+from datetime import datetime, timezone, timedelta
 
-on:
-  workflow_dispatch:
+# =========================
+# 1️⃣ SAFE DOWNLOAD
+# =========================
+def safe_download(ticker):
+    try:
+        df = yf.download(
+            ticker,
+            period="1y",
+            interval="1d",
+            progress=False,
+            threads=False
+        )
+        if df is None or df.empty:
+            return None
 
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
 
-    steps:
-      - uses: actions/checkout@v4
+        return df.dropna()
+    except:
+        return None
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
 
-      - run: pip install yfinance pandas ta requests
+# =========================
+# 2️⃣ DATA FETCH
+# =========================
+def get_data():
+    assets = {
+        "0050": "0050.TW",
+        "00631L": "00631L.TW",
+        "6770": "6770.TW",
+        "NASDAQ": "^IXIC",
+        "VIX": "^VIX"
+    }
 
-      - name: Run bot
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: python main.py
+    data = {}
+    for k, v in assets.items():
+        df = safe_download(v)
+        if df is None:
+            continue
 
-      - name: Save state
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git add last_signal.json || true
-          git commit -m "update state" || exit 0
-          git push
+        data[k] = df
+
+    return data
+
+
+# =========================
+# 3️⃣ INDICATORS
+# =========================
+def add_indicators(df):
+    close = df["Close"]
+
+    df["MA10"] = close.rolling(10).mean()
+    df["MA20"] = close.rolling(20).mean()
+
+    bb = ta.volatility.BollingerBands(close, 20, 2)
+    df["BB_UPPER"] = bb.bollinger_hband()
+    df["BB_LOWER"] = bb.bollinger_lband()
+
+    df["RSI"] = ta.momentum.RSIIndicator(close, 14).rsi()
+    df["DEV"] = (close - df["MA10"]) / df["MA10"]
+
+    df["OBV"] = ta.volume.OnBalanceVolumeIndicator(
+        close, df["Volume"]
+    ).on_balance_volume()
+
+    return df
+
+
+# =========================
+# 4️⃣ SCORE ENGINE (0-100)
+# =========================
+def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip):
+
+    score = 50
+
+    # trend
+    if price > ma10:
+        score += 10
+    else:
+        score -= 10
+
+    # RSI
+    if 50 < rsi < 65:
+        score += 15
+    elif rsi > 75:
+        score -= 20
+
+    # deviation
+    if dev > 0.05:
+        score -= 15
+    elif dev < -0.05:
+        score += 15
+
+    # bollinger
+    if price < bb_low:
+        score += 10
+    elif price > bb_up:
+        score -= 15
+
+    # VIX risk
+    if vix > 25:
+        score *= 0.7
+
+    # chip
+    if chip:
+        score += 10
+    else:
+        score -= 5
+
+    return max(0, min(100, score))
+
+
+# =========================
+# 5️⃣ ANALYZE ASSET
+# =========================
+def analyze(df, vix):
+
+    price = df["Close"].iloc[-1]
+    ma10 = df["MA10"].iloc[-1]
+    rsi = df["RSI"].iloc[-1]
+    dev = df["DEV"].iloc[-1]
+    bb_up = df["BB_UPPER"].iloc[-1]
+    bb_low = df["BB_LOWER"].iloc[-1]
+
+    obv_now = df["OBV"].iloc[-1]
+    obv_ma = df["OBV"].rolling(5).mean().iloc[-1]
+
+    chip = obv_now > obv_ma
+
+    score = score_engine(
+        rsi, dev, price, ma10, bb_up, bb_low, vix, chip
+    )
+
+    if score >= 80:
+        tag = "🚀 主升段"
+    elif score >= 65:
+        tag = "🟢 強勢"
+    elif score >= 50:
+        tag = "🟡 可布局"
+    elif score >= 30:
+        tag = "⚠️ 觀望"
+    else:
+        tag = "❌ 風險"
+
+    return {
+        "price": price,
+        "ma10": ma10,
+        "rsi": rsi,
+        "dev": dev,
+        "bb_up": bb_up,
+        "bb_low": bb_low,
+        "chip": chip,
+        "score": score,
+        "tag": tag,
+        "pos": int(min(score / 100 * 40, 40)),
+        "stop": ma10 * 0.95,
+        "logic": f"Quant Score: {score:.0f}/100"
+    }
+
+
+# =========================
+# 6️⃣ FORMAT REPORT
+# =========================
+def format_block(name, desc, res):
+
+    return f"""
+📊 {name} — {desc}
+
+🏷️ {res['tag']} ({res['score']:.0f}/100)
+💰 {res['price']:.2f}
+RSI:{res['rsi']:.1f} | 籌碼:{'強' if res['chip'] else '弱'}
+📦 倉位:{res['pos']}%
+📉 支撐:{res['bb_low']:.2f}
+📈 壓力:{res['bb_up']:.2f}
+🛑 風控:{res['stop']:.2f}
+🧠 {res['logic']}
+"""
+
+
+# =========================
+# 7️⃣ MAIN ENGINE
+# =========================
+def run():
+
+    data = get_data()
+
+    required = ["0050", "00631L"]
+    if not all(k in data for k in required):
+        print("❌ missing data")
+        return
+
+    processed = {k: add_indicators(v) for k, v in data.items()}
+
+    tw = processed["0050"].iloc[-1]
+    us = processed.get("NASDAQ")
+    vix = processed.get("VIX")
+
+    vix_val = vix["Close"].iloc[-1] if vix is not None else 20
+
+    tw_ok = tw["Close"] > tw["MA20"] and tw["RSI"] > 50
+    us_ok = us["Close"].iloc[-1] > us["MA20"].iloc[-1] if us is not None else True
+
+    if tw_ok and us_ok:
+        regime = "🌕牛市"
+    elif tw_ok or us_ok:
+        regime = "🌓震盪"
+    else:
+        regime = "🌑防守"
+
+    etf = analyze(processed["00631L"], vix_val)
+    stock = analyze(processed["6770"], vix_val)
+
+    ranking = sorted(
+        [
+            ("00631L", etf),
+            ("6770", stock)
+        ],
+        key=lambda x: x[1]["score"],
+        reverse=True
+    )
+
+    tz = timezone(timedelta(hours=8))
+    now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
+
+    msg = f"""
+📊 V9.3 QUANT FUND ENGINE ({now})
+
+🌎 市場：{regime} | VIX:{vix_val:.1f}
+
+🥇 最強標的：{ranking[0][0]} ({ranking[0][1]['score']:.0f})
+
+{format_block("00631L", "元大台灣50正2", etf)}
+
+{format_block("6770", "力積電", stock)}
+"""
+
+    token = os.getenv("BOT_TOKEN")
+    chat_id = os.getenv("CHAT_ID")
+
+    if not token or not chat_id:
+        print(msg)
+        return
+
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        res = requests.get(
+            url,
+            params={"chat_id": chat_id, "text": msg},
+            timeout=10
+        )
+
+        if res.status_code == 200:
+            print("✅ sent")
+        else:
+            print("❌ telegram error:", res.text)
+
+    except Exception as e:
+        print("❌ exception:", e)
+
+
+if __name__ == "__main__":
+    run()

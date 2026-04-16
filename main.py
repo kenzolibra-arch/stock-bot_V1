@@ -1,60 +1,39 @@
-# === V9.3 QUANT FUND ENGINE (STABLE + SPLIT FIX) ===
+# === V9.4 QUANT FUND ENGINE (TREND + MEMORY) ===
 import yfinance as yf
 import pandas as pd
 import ta
 import requests
 import os
+import json
 from datetime import datetime, timezone, timedelta
+
+STATE_FILE = "last_signal.json"
 
 # =========================
 # SAFE DOWNLOAD
 # =========================
 def safe_download(ticker):
     try:
-        df = yf.download(
-            ticker,
-            period="1y",
-            interval="1d",
-            progress=False,
-            threads=False
-        )
+        df = yf.download(ticker, period="1y", interval="1d", progress=False, threads=False)
         if df is None or df.empty:
             return None
-
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-
         return df.dropna()
-    except Exception as e:
-        print(f"❌ {ticker} error:", e)
+    except:
         return None
 
-
 # =========================
-# 🔥 00631L 拆分修正（升級版）
+# SPLIT FIX
 # =========================
 def fix_00631L_split(df):
-    try:
-        if len(df) < 50:
-            return df
-
-        recent_price = df["Close"].iloc[-1]
-        max_price = df["Close"].max()
-
-        # 判斷是否存在拆分斷層
-        if max_price / recent_price > 10:
-            print("⚠️ 偵測到 00631L 拆分斷層，進行修正")
-
-            mask = df["Close"] > recent_price * 5
-
-            df.loc[mask, "Close"] = df.loc[mask, "Close"] / 22
-
+    if len(df) < 50:
         return df
-
-    except Exception as e:
-        print("❌ split fix error:", e)
-        return df
-
+    recent = df["Close"].iloc[-1]
+    if df["Close"].max() / recent > 10:
+        mask = df["Close"] > recent * 5
+        df.loc[mask, "Close"] /= 22
+    return df
 
 # =========================
 # DATA
@@ -64,85 +43,73 @@ def get_data():
         "0050": "0050.TW",
         "00631L": "00631L.TW",
         "6770": "6770.TW",
-        "NASDAQ": "^IXIC",
         "VIX": "^VIX"
     }
-
     data = {}
-
     for k, v in assets.items():
         df = safe_download(v)
         if df is None:
             continue
-
-        # 🔥 套用拆分修正
         if k == "00631L":
             df = fix_00631L_split(df)
-
         data[k] = df
-
     return data
-
 
 # =========================
 # INDICATORS
 # =========================
 def add_indicators(df):
     close = df["Close"]
-
     df["MA10"] = close.rolling(10).mean()
     df["MA20"] = close.rolling(20).mean()
-
     bb = ta.volatility.BollingerBands(close, 20, 2)
     df["BB_UPPER"] = bb.bollinger_hband()
     df["BB_LOWER"] = bb.bollinger_lband()
-
     df["RSI"] = ta.momentum.RSIIndicator(close, 14).rsi()
     df["DEV"] = (close - df["MA10"]) / df["MA10"]
-
-    df["OBV"] = ta.volume.OnBalanceVolumeIndicator(
-        close, df["Volume"]
-    ).on_balance_volume()
-
+    df["OBV"] = ta.volume.OnBalanceVolumeIndicator(close, df["Volume"]).on_balance_volume()
     return df
 
+# =========================
+# 主升段偵測
+# =========================
+def detect_trend(df):
+    ma10 = df["MA10"].iloc[-1]
+    ma20 = df["MA20"].iloc[-1]
+    rsi = df["RSI"].iloc[-1]
+
+    price = df["Close"].iloc[-1]
+    obv_now = df["OBV"].iloc[-1]
+    obv_prev = df["OBV"].shift(3).iloc[-1]
+
+    if ma10 > ma20 and price > ma10 and rsi > 60 and obv_now > obv_prev:
+        return True
+    return False
 
 # =========================
-# SCORE ENGINE
+# SCORE
 # =========================
 def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip):
     score = 50
 
-    if price > ma10:
-        score += 10
-    else:
-        score -= 10
+    if price > ma10: score += 10
+    else: score -= 10
 
-    if 50 < rsi < 65:
-        score += 15
-    elif rsi > 75:
-        score -= 20
+    if 50 < rsi < 65: score += 15
+    elif rsi > 75: score -= 20
 
-    if dev > 0.05:
-        score -= 15
-    elif dev < -0.05:
-        score += 15
+    if dev > 0.05: score -= 15
+    elif dev < -0.05: score += 15
 
-    if price < bb_low:
-        score += 10
-    elif price > bb_up:
-        score -= 15
+    if price < bb_low: score += 10
+    elif price > bb_up: score -= 15
 
-    if vix > 25:
-        score *= 0.7
+    if vix > 25: score *= 0.7
 
-    if chip:
-        score += 10
-    else:
-        score -= 5
+    if chip: score += 10
+    else: score -= 5
 
     return max(0, min(100, score))
-
 
 # =========================
 # ANALYZE
@@ -159,9 +126,14 @@ def analyze(df, vix):
     obv_ma = df["OBV"].rolling(5).mean().iloc[-1]
     chip = obv_now > obv_ma
 
+    trend = detect_trend(df)
+
     score = score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip)
 
-    if score >= 80:
+    if trend:
+        tag = "🚀 主升段(早期)"
+        score = max(score, 75)
+    elif score >= 80:
         tag = "🚀 主升段"
     elif score >= 65:
         tag = "🟢 強勢"
@@ -184,6 +156,23 @@ def analyze(df, vix):
         "stop": ma10 * 0.95
     }
 
+# =========================
+# 訊號變化判斷
+# =========================
+def should_notify(new, old):
+    if not old:
+        return True
+
+    if new["tag"] != old.get("tag"):
+        return True
+
+    if abs(new["score"] - old.get("score", 0)) >= 10:
+        return True
+
+    if abs(new["pos"] - old.get("pos", 0)) >= 10:
+        return True
+
+    return False
 
 # =========================
 # FORMAT
@@ -201,33 +190,52 @@ RSI:{res['rsi']:.1f} | 籌碼:{'強' if res['chip'] else '弱'}
 🛑 風控:{res['stop']:.2f}
 """
 
-
 # =========================
 # MAIN
 # =========================
 def run():
     data = get_data()
-
     if not all(k in data for k in ["0050", "00631L"]):
-        print("❌ core data missing")
+        print("❌ data missing")
         return
 
     processed = {k: add_indicators(v) for k, v in data.items()}
+    vix = processed.get("VIX", {}).get("Close", pd.Series([20])).iloc[-1]
 
-    vix_val = processed.get("VIX", {}).get("Close", pd.Series([20])).iloc[-1]
+    etf = analyze(processed["00631L"], vix)
+    stock = analyze(processed["6770"], vix)
 
-    etf = analyze(processed["00631L"], vix_val)
-    stock = analyze(processed["6770"], vix_val)
+    # 讀取舊訊號
+    old = {}
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            old = json.load(f)
+
+    notify = (
+        should_notify(etf, old.get("00631L")) or
+        should_notify(stock, old.get("6770"))
+    )
 
     tz = timezone(timedelta(hours=8))
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
 
     msg = f"""
-📊 V9.3 QUANT REPORT ({now})
+📊 V9.4 QUANT REPORT ({now})
 
 {format_block("00631L", "元大台灣50正2", etf)}
 {format_block("6770", "力積電", stock)}
 """
+
+    # 儲存新狀態
+    with open(STATE_FILE, "w") as f:
+        json.dump({
+            "00631L": etf,
+            "6770": stock
+        }, f)
+
+    if not notify:
+        print("⏸️ 無訊號變化，不推播")
+        return
 
     token = os.getenv("BOT_TOKEN")
     chat_id = os.getenv("CHAT_ID")
@@ -236,13 +244,9 @@ def run():
         print(msg)
         return
 
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        res = requests.get(url, params={"chat_id": chat_id, "text": msg}, timeout=10)
-        print("✅ sent" if res.status_code == 200 else res.text)
-    except Exception as e:
-        print("❌", e)
-
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    requests.get(url, params={"chat_id": chat_id, "text": msg}, timeout=10)
+    print("✅ 發送訊號")
 
 if __name__ == "__main__":
     run()

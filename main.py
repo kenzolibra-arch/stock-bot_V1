@@ -1,4 +1,4 @@
-# === V9.3 QUANT FUND ENGINE (STABLE) ===
+# === V9.3 QUANT FUND ENGINE (STABLE + SPLIT FIX) ===
 import yfinance as yf
 import pandas as pd
 import ta
@@ -29,6 +29,33 @@ def safe_download(ticker):
         print(f"❌ {ticker} error:", e)
         return None
 
+
+# =========================
+# 🔥 00631L 拆分修正（升級版）
+# =========================
+def fix_00631L_split(df):
+    try:
+        if len(df) < 50:
+            return df
+
+        recent_price = df["Close"].iloc[-1]
+        max_price = df["Close"].max()
+
+        # 判斷是否存在拆分斷層
+        if max_price / recent_price > 10:
+            print("⚠️ 偵測到 00631L 拆分斷層，進行修正")
+
+            mask = df["Close"] > recent_price * 5
+
+            df.loc[mask, "Close"] = df.loc[mask, "Close"] / 22
+
+        return df
+
+    except Exception as e:
+        print("❌ split fix error:", e)
+        return df
+
+
 # =========================
 # DATA
 # =========================
@@ -42,12 +69,20 @@ def get_data():
     }
 
     data = {}
+
     for k, v in assets.items():
         df = safe_download(v)
-        if df is not None:
-            data[k] = df
+        if df is None:
+            continue
+
+        # 🔥 套用拆分修正
+        if k == "00631L":
+            df = fix_00631L_split(df)
+
+        data[k] = df
 
     return data
+
 
 # =========================
 # INDICATORS
@@ -70,6 +105,7 @@ def add_indicators(df):
     ).on_balance_volume()
 
     return df
+
 
 # =========================
 # SCORE ENGINE
@@ -106,6 +142,7 @@ def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip):
         score -= 5
 
     return max(0, min(100, score))
+
 
 # =========================
 # ANALYZE
@@ -147,6 +184,7 @@ def analyze(df, vix):
         "stop": ma10 * 0.95
     }
 
+
 # =========================
 # FORMAT
 # =========================
@@ -162,6 +200,7 @@ RSI:{res['rsi']:.1f} | 籌碼:{'強' if res['chip'] else '弱'}
 📈 壓力:{res['bb_up']:.2f}
 🛑 風控:{res['stop']:.2f}
 """
+
 
 # =========================
 # MAIN
@@ -203,6 +242,7 @@ def run():
         print("✅ sent" if res.status_code == 200 else res.text)
     except Exception as e:
         print("❌", e)
+
 
 if __name__ == "__main__":
     run()

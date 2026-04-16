@@ -2,7 +2,7 @@ name: Stock Bot Test
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # 每5分鐘跑一次（測試用）
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:

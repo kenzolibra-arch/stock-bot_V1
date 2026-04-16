@@ -1,4 +1,4 @@
-# === V9.4 QUANT FUND ENGINE (TREND + MEMORY) ===
+# === V9.4.1 QUANT FUND ENGINE (STABLE FINAL) ===
 import yfinance as yf
 import pandas as pd
 import ta
@@ -24,15 +24,16 @@ def safe_download(ticker):
         return None
 
 # =========================
-# SPLIT FIX
+# SPLIT FIX（00631L）
 # =========================
 def fix_00631L_split(df):
     if len(df) < 50:
         return df
     recent = df["Close"].iloc[-1]
     if df["Close"].max() / recent > 10:
+        print("⚠️ 偵測到 00631L 拆分，已修正")
         mask = df["Close"] > recent * 5
-        df.loc[mask, "Close"] /= 22
+        df.loc[mask, "Close"] = df.loc[mask, "Close"] / 22
     return df
 
 # =========================
@@ -45,14 +46,18 @@ def get_data():
         "6770": "6770.TW",
         "VIX": "^VIX"
     }
+
     data = {}
     for k, v in assets.items():
         df = safe_download(v)
         if df is None:
             continue
+
         if k == "00631L":
             df = fix_00631L_split(df)
+
         data[k] = df
+
     return data
 
 # =========================
@@ -60,14 +65,21 @@ def get_data():
 # =========================
 def add_indicators(df):
     close = df["Close"]
+
     df["MA10"] = close.rolling(10).mean()
     df["MA20"] = close.rolling(20).mean()
+
     bb = ta.volatility.BollingerBands(close, 20, 2)
     df["BB_UPPER"] = bb.bollinger_hband()
     df["BB_LOWER"] = bb.bollinger_lband()
+
     df["RSI"] = ta.momentum.RSIIndicator(close, 14).rsi()
     df["DEV"] = (close - df["MA10"]) / df["MA10"]
-    df["OBV"] = ta.volume.OnBalanceVolumeIndicator(close, df["Volume"]).on_balance_volume()
+
+    df["OBV"] = ta.volume.OnBalanceVolumeIndicator(
+        close, df["Volume"]
+    ).on_balance_volume()
+
     return df
 
 # =========================
@@ -77,14 +89,12 @@ def detect_trend(df):
     ma10 = df["MA10"].iloc[-1]
     ma20 = df["MA20"].iloc[-1]
     rsi = df["RSI"].iloc[-1]
-
     price = df["Close"].iloc[-1]
+
     obv_now = df["OBV"].iloc[-1]
     obv_prev = df["OBV"].shift(3).iloc[-1]
 
-    if ma10 > ma20 and price > ma10 and rsi > 60 and obv_now > obv_prev:
-        return True
-    return False
+    return bool(ma10 > ma20 and price > ma10 and rsi > 60 and obv_now > obv_prev)
 
 # =========================
 # SCORE
@@ -109,22 +119,23 @@ def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip):
     if chip: score += 10
     else: score -= 5
 
-    return max(0, min(100, score))
+    return float(max(0, min(100, score)))
 
 # =========================
-# ANALYZE
+# ANALYZE（已修正 JSON 問題）
 # =========================
 def analyze(df, vix):
-    price = df["Close"].iloc[-1]
-    ma10 = df["MA10"].iloc[-1]
-    rsi = df["RSI"].iloc[-1]
-    dev = df["DEV"].iloc[-1]
-    bb_up = df["BB_UPPER"].iloc[-1]
-    bb_low = df["BB_LOWER"].iloc[-1]
+    price = float(df["Close"].iloc[-1])
+    ma10 = float(df["MA10"].iloc[-1])
+    rsi = float(df["RSI"].iloc[-1])
+    dev = float(df["DEV"].iloc[-1])
+    bb_up = float(df["BB_UPPER"].iloc[-1])
+    bb_low = float(df["BB_LOWER"].iloc[-1])
 
     obv_now = df["OBV"].iloc[-1]
     obv_ma = df["OBV"].rolling(5).mean().iloc[-1]
-    chip = obv_now > obv_ma
+
+    chip = bool(obv_now > obv_ma)  # 🔥 修正關鍵
 
     trend = detect_trend(df)
 
@@ -150,10 +161,10 @@ def analyze(df, vix):
         "bb_up": bb_up,
         "bb_low": bb_low,
         "chip": chip,
-        "score": score,
-        "tag": tag,
+        "score": float(score),
+        "tag": str(tag),
         "pos": int(min(score / 100 * 40, 40)),
-        "stop": ma10 * 0.95
+        "stop": float(ma10 * 0.95)
     }
 
 # =========================
@@ -175,7 +186,7 @@ def should_notify(new, old):
     return False
 
 # =========================
-# FORMAT
+# FORMAT（保持你原本格式）
 # =========================
 def format_block(name, desc, res):
     return f"""
@@ -195,21 +206,26 @@ RSI:{res['rsi']:.1f} | 籌碼:{'強' if res['chip'] else '弱'}
 # =========================
 def run():
     data = get_data()
+
     if not all(k in data for k in ["0050", "00631L"]):
         print("❌ data missing")
         return
 
     processed = {k: add_indicators(v) for k, v in data.items()}
-    vix = processed.get("VIX", {}).get("Close", pd.Series([20])).iloc[-1]
+
+    vix = float(processed.get("VIX", {}).get("Close", pd.Series([20])).iloc[-1])
 
     etf = analyze(processed["00631L"], vix)
     stock = analyze(processed["6770"], vix)
 
-    # 讀取舊訊號
+    # === 讀取舊資料 ===
     old = {}
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            old = json.load(f)
+        try:
+            with open(STATE_FILE, "r") as f:
+                old = json.load(f)
+        except:
+            old = {}
 
     notify = (
         should_notify(etf, old.get("00631L")) or
@@ -226,7 +242,7 @@ def run():
 {format_block("6770", "力積電", stock)}
 """
 
-    # 儲存新狀態
+    # === 儲存新狀態 ===
     with open(STATE_FILE, "w") as f:
         json.dump({
             "00631L": etf,
@@ -234,7 +250,7 @@ def run():
         }, f)
 
     if not notify:
-        print("⏸️ 無訊號變化，不推播")
+        print("⏸️ 無變化，不推播")
         return
 
     token = os.getenv("BOT_TOKEN")
@@ -244,9 +260,12 @@ def run():
         print(msg)
         return
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    requests.get(url, params={"chat_id": chat_id, "text": msg}, timeout=10)
-    print("✅ 發送訊號")
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        res = requests.get(url, params={"chat_id": chat_id, "text": msg}, timeout=10)
+        print("✅ 發送成功" if res.status_code == 200 else res.text)
+    except Exception as e:
+        print("❌ 發送錯誤:", e)
 
 if __name__ == "__main__":
     run()

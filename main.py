@@ -1,14 +1,13 @@
-# === V9.1.14 STABLE PRODUCTION VERSION ===
+# === V9.3 QUANT FUND ENGINE (STABLE) ===
 import yfinance as yf
 import pandas as pd
-import numpy as np
 import ta
 import requests
 import os
 from datetime import datetime, timezone, timedelta
 
 # =========================
-# 1️⃣ 安全下載（核心修復）
+# SAFE DOWNLOAD
 # =========================
 def safe_download(ticker):
     try:
@@ -19,7 +18,6 @@ def safe_download(ticker):
             progress=False,
             threads=False
         )
-
         if df is None or df.empty:
             return None
 
@@ -27,14 +25,12 @@ def safe_download(ticker):
             df.columns = df.columns.get_level_values(0)
 
         return df.dropna()
-
     except Exception as e:
-        print(f"❌ {ticker} 下載失敗: {e}")
+        print(f"❌ {ticker} error:", e)
         return None
 
-
 # =========================
-# 2️⃣ 數據抓取
+# DATA
 # =========================
 def get_data():
     assets = {
@@ -46,38 +42,23 @@ def get_data():
     }
 
     data = {}
-
     for k, v in assets.items():
         df = safe_download(v)
-        if df is None:
-            continue
-
-        # 00631L 拆股修正
-        if k == "00631L":
-            try:
-                current_p = df["Close"].iloc[-1]
-                if df["Close"].max() / current_p > 10:
-                    df.loc[df["Close"] > 80, "Close"] /= 22
-            except:
-                pass
-
-        data[k] = df
+        if df is not None:
+            data[k] = df
 
     return data
 
-
 # =========================
-# 3️⃣ 技術指標
+# INDICATORS
 # =========================
 def add_indicators(df):
-    df = df.copy()
-
     close = df["Close"]
 
     df["MA10"] = close.rolling(10).mean()
     df["MA20"] = close.rolling(20).mean()
 
-    bb = ta.volatility.BollingerBands(close=close, window=20, window_dev=2)
+    bb = ta.volatility.BollingerBands(close, 20, 2)
     df["BB_UPPER"] = bb.bollinger_hband()
     df["BB_LOWER"] = bb.bollinger_lband()
 
@@ -90,28 +71,44 @@ def add_indicators(df):
 
     return df
 
+# =========================
+# SCORE ENGINE
+# =========================
+def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip):
+    score = 50
 
-# =========================
-# 4️⃣ 邏輯分析
-# =========================
-def get_logic(tag, rsi, chip, vix):
+    if price > ma10:
+        score += 10
+    else:
+        score -= 10
+
+    if 50 < rsi < 65:
+        score += 15
+    elif rsi > 75:
+        score -= 20
+
+    if dev > 0.05:
+        score -= 15
+    elif dev < -0.05:
+        score += 15
+
+    if price < bb_low:
+        score += 10
+    elif price > bb_up:
+        score -= 15
+
     if vix > 25:
-        return f"⚠️ VIX高檔({vix:.1f})，市場風險升高"
+        score *= 0.7
 
-    if tag == "🔴 SELL":
-        return f"過熱區 RSI:{rsi:.1f}，避免追高"
+    if chip:
+        score += 10
+    else:
+        score -= 5
 
-    if tag == "🟢 DCA":
-        return "超跌區，分批佈局較佳" + ("（籌碼強）" if chip else "")
-
-    if tag == "🔵 BUY":
-        return "趨勢轉強，可順勢加碼"
-
-    return "震盪區間，觀望為主"
-
+    return max(0, min(100, score))
 
 # =========================
-# 5️⃣ 分析單一資產
+# ANALYZE
 # =========================
 def analyze(df, vix):
     price = df["Close"].iloc[-1]
@@ -122,63 +119,63 @@ def analyze(df, vix):
     bb_low = df["BB_LOWER"].iloc[-1]
 
     obv_now = df["OBV"].iloc[-1]
-    obv_prev = df["OBV"].rolling(5).mean().iloc[-1]
+    obv_ma = df["OBV"].rolling(5).mean().iloc[-1]
+    chip = obv_now > obv_ma
 
-    chip_strong = obv_now > obv_prev
+    score = score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip)
 
-    # 訊號
-    if price > bb_up or dev > 0.08 or rsi > 70:
-        tag, score = "🔴 SELL", 0
-    elif 0 < dev < 0.03 and rsi > 55:
-        tag, score = "🔵 BUY", 2
-    elif price < ma10 and (price < bb_low or rsi < 40):
-        tag, score = "🟢 DCA", 3
+    if score >= 80:
+        tag = "🚀 主升段"
+    elif score >= 65:
+        tag = "🟢 強勢"
+    elif score >= 50:
+        tag = "🟡 可布局"
+    elif score >= 30:
+        tag = "⚠️ 觀望"
     else:
-        tag, score = "🟡 HOLD", 1
+        tag = "❌ 風險"
 
     return {
         "price": price,
-        "ma10": ma10,
         "rsi": rsi,
-        "dev": dev,
         "bb_up": bb_up,
         "bb_low": bb_low,
+        "chip": chip,
+        "score": score,
         "tag": tag,
-        "chip": chip_strong,
-        "pos": int(min((score / 3) * 30, 40)),
-        "stop": ma10 * 0.95,
-        "logic": get_logic(tag, rsi, chip_strong, vix)
+        "pos": int(min(score / 100 * 40, 40)),
+        "stop": ma10 * 0.95
     }
 
+# =========================
+# FORMAT
+# =========================
+def format_block(name, desc, res):
+    return f"""
+📊 {name} — {desc}
+
+🏷️ {res['tag']} ({res['score']:.0f}/100)
+💰 {res['price']:.2f}
+RSI:{res['rsi']:.1f} | 籌碼:{'強' if res['chip'] else '弱'}
+📦 倉位:{res['pos']}%
+📉 支撐:{res['bb_low']:.2f}
+📈 壓力:{res['bb_up']:.2f}
+🛑 風控:{res['stop']:.2f}
+"""
 
 # =========================
-# 6️⃣ 主流程
+# MAIN
 # =========================
 def run():
     data = get_data()
 
-    required = ["0050", "00631L"]
-    if not all(k in data for k in required):
-        print("❌ 核心數據不足，停止執行")
+    if not all(k in data for k in ["0050", "00631L"]):
+        print("❌ core data missing")
         return
 
     processed = {k: add_indicators(v) for k, v in data.items()}
 
-    tw = processed["0050"].iloc[-1]
-    us = processed.get("NASDAQ")
-    vix = processed.get("VIX")
-
-    vix_val = vix["Close"].iloc[-1] if vix is not None else 20
-
-    tw_ok = tw["Close"] > tw["MA20"] and tw["RSI"] > 50
-    us_ok = us["Close"].iloc[-1] > us["MA20"].iloc[-1] if us is not None else True
-
-    if tw_ok and us_ok:
-        regime = "🌕強多"
-    elif tw_ok or us_ok:
-        regime = "🌓震盪偏多"
-    else:
-        regime = "🌑防守"
+    vix_val = processed.get("VIX", {}).get("Close", pd.Series([20])).iloc[-1]
 
     etf = analyze(processed["00631L"], vix_val)
     stock = analyze(processed["6770"], vix_val)
@@ -187,26 +184,10 @@ def run():
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
 
     msg = f"""
-📊 V9.1.14 STABLE REPORT ({now})
+📊 V9.3 QUANT REPORT ({now})
 
-🌎 市場：{regime} | VIX:{vix_val:.1f}
-
-🚀 00631L
-📌 {etf['tag']}
-💰 {etf['price']:.2f}
-RSI:{etf['rsi']:.1f} | 籌碼:{'強' if etf['chip'] else '弱'}
-倉位:{etf['pos']}%
-支撐:{etf['bb_low']:.2f}
-壓力:{etf['bb_up']:.2f}
-風控:{etf['stop']:.2f}
-🧠 {etf['logic']}
-
-💎 6770
-📌 {stock['tag']}
-💰 {stock['price']:.2f}
-RSI:{stock['rsi']:.1f}
-倉位:{stock['pos']}%
-🧠 {stock['logic']}
+{format_block("00631L", "元大台灣50正2", etf)}
+{format_block("6770", "力積電", stock)}
 """
 
     token = os.getenv("BOT_TOKEN")
@@ -218,19 +199,10 @@ RSI:{stock['rsi']:.1f}
 
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        res = requests.get(url, params={
-            "chat_id": chat_id,
-            "text": msg
-        }, timeout=10)
-
-        if res.status_code != 200:
-            print("❌ Telegram error:", res.text)
-        else:
-            print("✅ Sent successfully")
-
+        res = requests.get(url, params={"chat_id": chat_id, "text": msg}, timeout=10)
+        print("✅ sent" if res.status_code == 200 else res.text)
     except Exception as e:
-        print("❌ Telegram exception:", e)
-
+        print("❌", e)
 
 if __name__ == "__main__":
     run()

@@ -1,4 +1,4 @@
-# === V10 QUANT ENGINE (MULTI-ASSET PRO) ===
+# === V10.2 QUANT ENGINE (GLOBAL FILTER VERSION) ===
 import yfinance as yf
 import pandas as pd
 import ta
@@ -24,7 +24,7 @@ def safe_download(ticker):
 
 
 # =========================
-# SPLIT FIX（00631L）
+# SPLIT FIX
 # =========================
 def fix_00631L_split(df):
     try:
@@ -50,6 +50,7 @@ def get_data():
         "00662": "00662.TW",
         "00646": "00646.TW",
         "00735": "00735.TW",
+        "6770": "6770.TW",
         "NASDAQ": "^IXIC",
         "VIX": "^VIX"
     }
@@ -90,9 +91,25 @@ def add_indicators(df):
 
 
 # =========================
-# SCORE ENGINE
+# 🌍 NASDAQ TREND FILTER
 # =========================
-def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip):
+def get_market_trend(nasdaq_df):
+    try:
+        close = nasdaq_df["Close"]
+        ma20 = close.rolling(20).mean()
+
+        if close.iloc[-1] > ma20.iloc[-1]:
+            return "BULL"
+        else:
+            return "BEAR"
+    except:
+        return "UNKNOWN"
+
+
+# =========================
+# SCORE ENGINE（加入全球濾網）
+# =========================
+def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip, market_trend):
     score = 50
 
     score += 10 if price > ma10 else -10
@@ -112,8 +129,13 @@ def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip):
     elif price > bb_up:
         score -= 15
 
+    # 🔴 VIX風控
     if vix > 25:
         score *= 0.7
+
+    # 🔴 NASDAQ 空頭壓制（關鍵）
+    if market_trend == "BEAR":
+        score -= 10
 
     score += 10 if chip else -5
 
@@ -121,9 +143,9 @@ def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip):
 
 
 # =========================
-# 🚀 主升段判定（只用在00631L）
+# 🚀 主升段（全球版）
 # =========================
-def is_bull_run(df, score, vix):
+def is_bull_run(df, score, vix, market_trend, is_stock=False):
     try:
         ma10_now = df["MA10"].iloc[-1]
         ma10_prev = df["MA10"].iloc[-2]
@@ -131,12 +153,15 @@ def is_bull_run(df, score, vix):
         obv_now = df["OBV"].iloc[-1]
         obv_prev = df["OBV"].iloc[-2]
 
+        score_th = 85 if is_stock else 80
+
         return (
-            score >= 80 and
+            score >= score_th and
             df["Close"].iloc[-1] > ma10_now and
             ma10_now > ma10_prev and
             obv_now > obv_prev and
-            vix < 22
+            vix < 22 and
+            market_trend == "BULL"   # 🔥 全球同步
         )
     except:
         return False
@@ -145,7 +170,7 @@ def is_bull_run(df, score, vix):
 # =========================
 # ANALYZE
 # =========================
-def analyze(df, vix):
+def analyze(df, vix, market_trend):
     if df is None or len(df) < 30:
         return None
 
@@ -153,14 +178,17 @@ def analyze(df, vix):
     ma10 = df["MA10"].iloc[-1]
     rsi = df["RSI"].iloc[-1]
     dev = df["DEV"].iloc[-1]
-    bb_up = df["BB_UPPER"].iloc[-1]
-    bb_low = df["BB_LOWER"].iloc[-1]
 
     obv_now = df["OBV"].iloc[-1]
     obv_ma = df["OBV"].rolling(5).mean().iloc[-1]
     chip = obv_now > obv_ma
 
-    score = score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip)
+    score = score_engine(
+        rsi, dev, price, ma10,
+        df["BB_UPPER"].iloc[-1],
+        df["BB_LOWER"].iloc[-1],
+        vix, chip, market_trend
+    )
 
     tag = (
         "🚀 主升段" if score >= 80 else
@@ -184,13 +212,15 @@ def analyze(df, vix):
 # =========================
 # FORMAT
 # =========================
-def format_block(name, res):
+def format_block(name, res, bull=False):
     if res is None:
         return f"\n📊 {name}\n❌ 無資料\n"
 
+    flag = "🚀 主升段狙擊\n" if bull else ""
+
     return f"""
 📊 {name}
-
+{flag}
 🏷️ {res['tag']} ({res['score']:.0f})
 💰 {res['price']:.2f}
 RSI:{res['rsi']:.1f} | 籌碼:{'強' if res['chip'] else '弱'}
@@ -206,24 +236,39 @@ def run():
     data = get_data()
     processed = {k: add_indicators(v) for k, v in data.items() if v is not None}
 
+    # 🌍 市場狀態
+    market_trend = get_market_trend(processed.get("NASDAQ"))
     vix = processed.get("VIX", {}).get("Close", pd.Series([20])).iloc[-1]
 
-    results = {k: analyze(processed.get(k), vix) for k in ["0050", "00631L", "00662", "00646", "00735"]}
+    assets = ["0050", "00631L", "00662", "00646", "00735", "6770"]
+    results = {k: analyze(processed.get(k), vix, market_trend) for k in assets}
 
-    bull = False
-    if "00631L" in processed:
-        bull = is_bull_run(processed["00631L"], results["00631L"]["score"], vix)
+    bull_flags = {}
+    for k in assets:
+        bull_flags[k] = (
+            k in processed and
+            results[k] is not None and
+            is_bull_run(
+                processed[k],
+                results[k]["score"],
+                vix,
+                market_trend,
+                is_stock=(k == "6770")
+            )
+        )
 
     tz = timezone(timedelta(hours=8))
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
 
-    msg = f"📊 V10 QUANT REPORT ({now})\n"
+    msg = f"📊 V10.2 QUANT REPORT ({now})\n"
+    msg += f"\n🌍 市場狀態：{market_trend} | VIX:{vix:.1f}\n"
 
-    if bull:
-        msg += "\n🚀【主升段啟動】建議加碼 00631L\n"
+    hot = [k for k, v in bull_flags.items() if v]
+    if hot:
+        msg += "\n🚀【主升段清單】\n" + " / ".join(hot) + "\n"
 
-    for k in ["0050", "00631L", "00662", "00646", "00735"]:
-        msg += format_block(k, results[k])
+    for k in assets:
+        msg += format_block(k, results[k], bull_flags[k])
 
     token = os.getenv("BOT_TOKEN")
     chat_id = os.getenv("CHAT_ID")

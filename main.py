@@ -1,4 +1,4 @@
-# === V10.3 QUANT ENGINE (DUAL MARKET FILTER) ===
+# === V10.4 QUANT ENGINE (DYNAMIC BB + MARKET LABEL) ===
 import yfinance as yf
 import pandas as pd
 import ta
@@ -92,15 +92,15 @@ def add_indicators(df):
 
 
 # =========================
-# 🌍 雙市場濾網
+# 🌍 市場狀態
 # =========================
 def get_market_state(nasdaq_df, sox_df):
-    try:
-        def trend(df):
-            close = df["Close"]
-            ma20 = close.rolling(20).mean()
-            return close.iloc[-1] > ma20.iloc[-1]
+    def trend(df):
+        close = df["Close"]
+        ma20 = close.rolling(20).mean()
+        return close.iloc[-1] > ma20.iloc[-1]
 
+    try:
         nasdaq_bull = trend(nasdaq_df)
         sox_bull = trend(sox_df)
 
@@ -114,8 +114,17 @@ def get_market_state(nasdaq_df, sox_df):
         return "UNKNOWN"
 
 
+def market_label(state):
+    return {
+        "STRONG_BULL": "多頭共振",
+        "MIXED": "分歧震盪",
+        "BEAR": "空頭風險",
+        "UNKNOWN": "資料不足"
+    }.get(state, "")
+
+
 # =========================
-# SCORE ENGINE（升級版）
+# SCORE ENGINE（🔥動態布林）
 # =========================
 def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip, market_state):
     score = 50
@@ -132,15 +141,20 @@ def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip, market_state):
     elif dev < -0.05:
         score += 15
 
+    # 🔥 動態布林
     if price < bb_low:
         score += 10
     elif price > bb_up:
-        score -= 15
+        if market_state == "STRONG_BULL":
+            score += 5   # 🚀 順勢
+        elif market_state == "BEAR":
+            score -= 20  # 🔴 避免追高
+        else:
+            score -= 10
 
     if vix > 25:
         score *= 0.7
 
-    # 🌍 市場濾網影響
     if market_state == "BEAR":
         score -= 15
     elif market_state == "MIXED":
@@ -152,7 +166,7 @@ def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip, market_state):
 
 
 # =========================
-# 🚀 主升段判定
+# 主升段
 # =========================
 def is_bull_run(df, score, vix, market_state, is_stock=False):
     try:
@@ -162,10 +176,10 @@ def is_bull_run(df, score, vix, market_state, is_stock=False):
         obv_now = df["OBV"].iloc[-1]
         obv_prev = df["OBV"].iloc[-2]
 
-        score_th = 85 if is_stock else 80
+        th = 85 if is_stock else 80
 
         return (
-            score >= score_th and
+            score >= th and
             df["Close"].iloc[-1] > ma10_now and
             ma10_now > ma10_prev and
             obv_now > obv_prev and
@@ -188,16 +202,14 @@ def analyze(df, vix, market_state):
     rsi = df["RSI"].iloc[-1]
     dev = df["DEV"].iloc[-1]
 
+    bb_up = df["BB_UPPER"].iloc[-1]
+    bb_low = df["BB_LOWER"].iloc[-1]
+
     obv_now = df["OBV"].iloc[-1]
     obv_ma = df["OBV"].rolling(5).mean().iloc[-1]
     chip = obv_now > obv_ma
 
-    score = score_engine(
-        rsi, dev, price, ma10,
-        df["BB_UPPER"].iloc[-1],
-        df["BB_LOWER"].iloc[-1],
-        vix, chip, market_state
-    )
+    score = score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip, market_state)
 
     tag = (
         "🚀 主升段" if score >= 80 else
@@ -214,12 +226,14 @@ def analyze(df, vix, market_state):
         "pos": int(min(score / 100 * 40, 40)),
         "stop": ma10 * 0.95,
         "rsi": rsi,
-        "chip": chip
+        "chip": chip,
+        "bb_up": bb_up,
+        "bb_low": bb_low
     }
 
 
 # =========================
-# FORMAT（完全不變）
+# FORMAT（保留原樣 + 增資訊）
 # =========================
 def format_block(name, res, bull=False):
     if res is None:
@@ -234,6 +248,7 @@ def format_block(name, res, bull=False):
 💰 {res['price']:.2f}
 RSI:{res['rsi']:.1f} | 籌碼:{'強' if res['chip'] else '弱'}
 📦 倉位:{res['pos']}%
+📉 下軌:{res['bb_low']:.2f} | 📈 上軌:{res['bb_up']:.2f}
 🛑 停損:{res['stop']:.2f}
 """
 
@@ -268,8 +283,8 @@ def run():
     tz = timezone(timedelta(hours=8))
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
 
-    msg = f"📊 V10.3 QUANT REPORT ({now})\n"
-    msg += f"\n🌍 市場狀態：{market_state} | VIX:{vix:.1f}\n"
+    msg = f"📊 V10.4 QUANT REPORT ({now})\n"
+    msg += f"\n🌍 市場狀態：{market_state}（{market_label(market_state)}） | VIX:{vix:.1f}\n"
 
     hot = [k for k, v in bull_flags.items() if v]
     if hot:

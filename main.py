@@ -1,4 +1,4 @@
-# === V10.2 QUANT ENGINE (GLOBAL FILTER VERSION) ===
+# === V10.3 QUANT ENGINE (DUAL MARKET FILTER) ===
 import yfinance as yf
 import pandas as pd
 import ta
@@ -52,6 +52,7 @@ def get_data():
         "00735": "00735.TW",
         "6770": "6770.TW",
         "NASDAQ": "^IXIC",
+        "SOX": "^SOX",
         "VIX": "^VIX"
     }
 
@@ -91,25 +92,32 @@ def add_indicators(df):
 
 
 # =========================
-# 🌍 NASDAQ TREND FILTER
+# 🌍 雙市場濾網
 # =========================
-def get_market_trend(nasdaq_df):
+def get_market_state(nasdaq_df, sox_df):
     try:
-        close = nasdaq_df["Close"]
-        ma20 = close.rolling(20).mean()
+        def trend(df):
+            close = df["Close"]
+            ma20 = close.rolling(20).mean()
+            return close.iloc[-1] > ma20.iloc[-1]
 
-        if close.iloc[-1] > ma20.iloc[-1]:
-            return "BULL"
-        else:
+        nasdaq_bull = trend(nasdaq_df)
+        sox_bull = trend(sox_df)
+
+        if nasdaq_bull and sox_bull:
+            return "STRONG_BULL"
+        elif not nasdaq_bull and not sox_bull:
             return "BEAR"
+        else:
+            return "MIXED"
     except:
         return "UNKNOWN"
 
 
 # =========================
-# SCORE ENGINE（加入全球濾網）
+# SCORE ENGINE（升級版）
 # =========================
-def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip, market_trend):
+def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip, market_state):
     score = 50
 
     score += 10 if price > ma10 else -10
@@ -129,13 +137,14 @@ def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip, market_trend):
     elif price > bb_up:
         score -= 15
 
-    # 🔴 VIX風控
     if vix > 25:
         score *= 0.7
 
-    # 🔴 NASDAQ 空頭壓制（關鍵）
-    if market_trend == "BEAR":
-        score -= 10
+    # 🌍 市場濾網影響
+    if market_state == "BEAR":
+        score -= 15
+    elif market_state == "MIXED":
+        score -= 5
 
     score += 10 if chip else -5
 
@@ -143,9 +152,9 @@ def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip, market_trend):
 
 
 # =========================
-# 🚀 主升段（全球版）
+# 🚀 主升段判定
 # =========================
-def is_bull_run(df, score, vix, market_trend, is_stock=False):
+def is_bull_run(df, score, vix, market_state, is_stock=False):
     try:
         ma10_now = df["MA10"].iloc[-1]
         ma10_prev = df["MA10"].iloc[-2]
@@ -161,7 +170,7 @@ def is_bull_run(df, score, vix, market_trend, is_stock=False):
             ma10_now > ma10_prev and
             obv_now > obv_prev and
             vix < 22 and
-            market_trend == "BULL"   # 🔥 全球同步
+            market_state != "BEAR"
         )
     except:
         return False
@@ -170,7 +179,7 @@ def is_bull_run(df, score, vix, market_trend, is_stock=False):
 # =========================
 # ANALYZE
 # =========================
-def analyze(df, vix, market_trend):
+def analyze(df, vix, market_state):
     if df is None or len(df) < 30:
         return None
 
@@ -187,7 +196,7 @@ def analyze(df, vix, market_trend):
         rsi, dev, price, ma10,
         df["BB_UPPER"].iloc[-1],
         df["BB_LOWER"].iloc[-1],
-        vix, chip, market_trend
+        vix, chip, market_state
     )
 
     tag = (
@@ -210,7 +219,7 @@ def analyze(df, vix, market_trend):
 
 
 # =========================
-# FORMAT
+# FORMAT（完全不變）
 # =========================
 def format_block(name, res, bull=False):
     if res is None:
@@ -236,12 +245,11 @@ def run():
     data = get_data()
     processed = {k: add_indicators(v) for k, v in data.items() if v is not None}
 
-    # 🌍 市場狀態
-    market_trend = get_market_trend(processed.get("NASDAQ"))
+    market_state = get_market_state(processed.get("NASDAQ"), processed.get("SOX"))
     vix = processed.get("VIX", {}).get("Close", pd.Series([20])).iloc[-1]
 
     assets = ["0050", "00631L", "00662", "00646", "00735", "6770"]
-    results = {k: analyze(processed.get(k), vix, market_trend) for k in assets}
+    results = {k: analyze(processed.get(k), vix, market_state) for k in assets}
 
     bull_flags = {}
     for k in assets:
@@ -252,7 +260,7 @@ def run():
                 processed[k],
                 results[k]["score"],
                 vix,
-                market_trend,
+                market_state,
                 is_stock=(k == "6770")
             )
         )
@@ -260,8 +268,8 @@ def run():
     tz = timezone(timedelta(hours=8))
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
 
-    msg = f"📊 V10.2 QUANT REPORT ({now})\n"
-    msg += f"\n🌍 市場狀態：{market_trend} | VIX:{vix:.1f}\n"
+    msg = f"📊 V10.3 QUANT REPORT ({now})\n"
+    msg += f"\n🌍 市場狀態：{market_state} | VIX:{vix:.1f}\n"
 
     hot = [k for k, v in bull_flags.items() if v]
     if hot:

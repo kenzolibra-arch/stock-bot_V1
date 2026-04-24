@@ -1,4 +1,4 @@
-# === V10.7 QUANT ENGINE (FULL EXPLAINED + CHIP FLOW LAYER) ===
+# === V10.7 QUANT ENGINE (FULL + MACRO EXPLAINED) ===
 
 import yfinance as yf
 import pandas as pd
@@ -34,8 +34,6 @@ def get_position_state(state, ticker, score):
 
     if ticker not in state:
         state[ticker] = "FLAT"
-
-    s = state[ticker]
 
     if score >= 80:
         new_state = "FULL"
@@ -115,7 +113,7 @@ def add_indicators(df):
     return df.dropna()
 
 # =====================================================
-# MARKET / MACRO (V10.6 unchanged)
+# MARKET / MACRO
 # =====================================================
 
 def trend(df):
@@ -149,7 +147,7 @@ def get_position_cap(macro_state):
     }.get(macro_state, 25)
 
 # =====================================================
-# SCORE ENGINE (UNCHANGED)
+# SCORE ENGINE
 # =====================================================
 
 def score_engine(price, ma10, rsi, dev, bb_up, bb_low, vix, market_state, macro_state):
@@ -187,46 +185,6 @@ def score_engine(price, ma10, rsi, dev, bb_up, bb_low, vix, market_state, macro_
     return max(0, min(100, score))
 
 # =====================================================
-# 🆕 COST / FLOW STRENGTH LAYER
-# =====================================================
-
-def chip_strength(df):
-
-    try:
-        obv = df["OBV"].iloc[-1]
-        obv_ma = df["OBV"].rolling(20).mean().iloc[-1]
-
-        price = df["Close"].iloc[-1]
-        ma20 = df["MA20"].iloc[-1]
-
-        score = 50
-
-        if obv > obv_ma:
-            score += 25
-        else:
-            score -= 25
-
-        if price > ma20:
-            score += 20
-        else:
-            score -= 10
-
-        return max(0, min(100, score))
-
-    except:
-        return 50
-
-def chip_tag(s):
-
-    if s >= 75:
-        return "🔥 強勢吸籌"
-    elif s >= 60:
-        return "🟢 偏多流入"
-    elif s >= 40:
-        return "🟡 中性整理"
-    return "🔴 籌碼偏弱"
-
-# =====================================================
 # ANALYZE
 # =====================================================
 
@@ -249,9 +207,6 @@ def analyze(df, vix, market_state, macro_state, cap, state, ticker):
     pos = min(int(score / 100 * 40), cap)
     pos = max(pos, int(position_map(pos_state) * cap))
 
-    chip = chip_strength(df)
-    chip_label = chip_tag(chip)
-
     tag = (
         "🚀 主升段" if score >= 80 else
         "🟢 強勢" if score >= 65 else
@@ -270,13 +225,11 @@ def analyze(df, vix, market_state, macro_state, cap, state, ticker):
         "rsi": rsi,
         "bb_up": bb_up,
         "bb_low": bb_low,
-        "state": pos_state,
-        "chip": chip,
-        "chip_tag": chip_label
+        "state": pos_state
     }, state, pos_state
 
 # =====================================================
-# FORMAT
+# FORMAT (MACRO EXPLAINED HERE)
 # =====================================================
 
 def format_block(name, r):
@@ -291,8 +244,6 @@ def format_block(name, r):
 
 📦 倉位:{r['pos']}%（上限{r['cap']}%）
 🧠 狀態:{r['state']} - {STATE_DESC.get(r['state'], "")}
-
-📊 籌碼強度:{r['chip']} ({r['chip_tag']})
 
 RSI:{r['rsi']:.1f}
 📉 下軌:{r['bb_low']:.2f} | 📈 上軌:{r['bb_up']:.2f}
@@ -337,11 +288,29 @@ def run():
     tz = timezone(timedelta(hours=8))
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
 
+    # =====================================================
+    # 🧠 MACRO EXPLAINED OUTPUT
+    # =====================================================
+
+    macro_desc = {
+        "RISK_ON": "資金寬鬆（流動性充裕，偏多環境）",
+        "RISK_OFF": "資金收縮（流動性緊縮，防禦環境）",
+        "NEUTRAL": "中性環境（無明確方向）"
+    }
+
+    market_desc = {
+        "STRONG_BULL": "多頭趨勢（科技+半導體同步強勢）",
+        "BEAR": "空頭趨勢（風險資產走弱）",
+        "MIXED": "分歧市場（結構不一致）",
+        "UNKNOWN": "未知狀態"
+    }
+
     msg = f"""
 📊 V10.7 QUANT REPORT ({now})
 
-🌍 市場：{market}
-🌐 宏觀：{macro}｜倉位上限：{cap}% | VIX:{vix:.1f}
+🌍 市場：{market} - {market_desc.get(market, "")}
+🌐 宏觀：{macro} - {macro_desc.get(macro, "")}
+📦 倉位上限：{cap}% | VIX:{vix:.1f}
 
 """
 

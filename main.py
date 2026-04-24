@@ -1,4 +1,4 @@
-# === V10.4 QUANT ENGINE (DYNAMIC BB + MARKET LABEL) ===
+# === V10.5 QUANT ENGINE (MACRO FILTER ADDED) ===
 import yfinance as yf
 import pandas as pd
 import ta
@@ -53,7 +53,9 @@ def get_data():
         "6770": "6770.TW",
         "NASDAQ": "^IXIC",
         "SOX": "^SOX",
-        "VIX": "^VIX"
+        "VIX": "^VIX",
+        "DXY": "DX-Y.NYB",
+        "OIL": "CL=F"
     }
 
     data = {}
@@ -92,7 +94,7 @@ def add_indicators(df):
 
 
 # =========================
-# 🌍 市場狀態
+# 🌍 市場濾網
 # =========================
 def get_market_state(nasdaq_df, sox_df):
     def trend(df):
@@ -101,12 +103,12 @@ def get_market_state(nasdaq_df, sox_df):
         return close.iloc[-1] > ma20.iloc[-1]
 
     try:
-        nasdaq_bull = trend(nasdaq_df)
-        sox_bull = trend(sox_df)
+        n = trend(nasdaq_df)
+        s = trend(sox_df)
 
-        if nasdaq_bull and sox_bull:
+        if n and s:
             return "STRONG_BULL"
-        elif not nasdaq_bull and not sox_bull:
+        elif not n and not s:
             return "BEAR"
         else:
             return "MIXED"
@@ -114,19 +116,51 @@ def get_market_state(nasdaq_df, sox_df):
         return "UNKNOWN"
 
 
-def market_label(state):
+def market_label(s):
     return {
         "STRONG_BULL": "多頭共振",
         "MIXED": "分歧震盪",
-        "BEAR": "空頭風險",
-        "UNKNOWN": "資料不足"
-    }.get(state, "")
+        "BEAR": "空頭風險"
+    }.get(s, "")
 
 
 # =========================
-# SCORE ENGINE（🔥動態布林）
+# 🌐 宏觀濾網（新增）
 # =========================
-def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip, market_state):
+def get_macro_state(dxy_df, oil_df):
+    try:
+        def up(df):
+            close = df["Close"]
+            ma20 = close.rolling(20).mean()
+            return close.iloc[-1] > ma20.iloc[-1]
+
+        dxy_up = up(dxy_df)
+        oil_up = up(oil_df)
+
+        if not dxy_up and not oil_up:
+            return "RISK_ON"
+        elif dxy_up and oil_up:
+            return "RISK_OFF"
+        else:
+            return "NEUTRAL"
+    except:
+        return "UNKNOWN"
+
+
+def macro_label(s):
+    return {
+        "RISK_ON": "資金寬鬆",
+        "RISK_OFF": "資金收縮",
+        "NEUTRAL": "中性"
+    }.get(s, "")
+
+
+# =========================
+# SCORE ENGINE（加入宏觀）
+# =========================
+def score_engine(rsi, dev, price, ma10, bb_up, bb_low,
+                 vix, chip, market_state, macro_state):
+
     score = 50
 
     score += 10 if price > ma10 else -10
@@ -141,24 +175,31 @@ def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip, market_state):
     elif dev < -0.05:
         score += 15
 
-    # 🔥 動態布林
+    # 動態布林
     if price < bb_low:
         score += 10
     elif price > bb_up:
         if market_state == "STRONG_BULL":
-            score += 5   # 🚀 順勢
+            score += 5
         elif market_state == "BEAR":
-            score -= 20  # 🔴 避免追高
+            score -= 20
         else:
             score -= 10
 
     if vix > 25:
         score *= 0.7
 
+    # 市場濾網
     if market_state == "BEAR":
         score -= 15
     elif market_state == "MIXED":
         score -= 5
+
+    # 🌐 宏觀濾網（新增）
+    if macro_state == "RISK_OFF":
+        score -= 10
+    elif macro_state == "RISK_ON":
+        score += 5
 
     score += 10 if chip else -5
 
@@ -166,7 +207,7 @@ def score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip, market_state):
 
 
 # =========================
-# 主升段
+# 主升段（不被宏觀干擾）
 # =========================
 def is_bull_run(df, score, vix, market_state, is_stock=False):
     try:
@@ -193,7 +234,7 @@ def is_bull_run(df, score, vix, market_state, is_stock=False):
 # =========================
 # ANALYZE
 # =========================
-def analyze(df, vix, market_state):
+def analyze(df, vix, market_state, macro_state):
     if df is None or len(df) < 30:
         return None
 
@@ -209,7 +250,13 @@ def analyze(df, vix, market_state):
     obv_ma = df["OBV"].rolling(5).mean().iloc[-1]
     chip = obv_now > obv_ma
 
-    score = score_engine(rsi, dev, price, ma10, bb_up, bb_low, vix, chip, market_state)
+    score = score_engine(
+        rsi, dev, price, ma10,
+        bb_up, bb_low,
+        vix, chip,
+        market_state,
+        macro_state
+    )
 
     tag = (
         "🚀 主升段" if score >= 80 else
@@ -233,7 +280,7 @@ def analyze(df, vix, market_state):
 
 
 # =========================
-# FORMAT（保留原樣 + 增資訊）
+# FORMAT
 # =========================
 def format_block(name, res, bull=False):
     if res is None:
@@ -261,10 +308,14 @@ def run():
     processed = {k: add_indicators(v) for k, v in data.items() if v is not None}
 
     market_state = get_market_state(processed.get("NASDAQ"), processed.get("SOX"))
+    macro_state = get_macro_state(processed.get("DXY"), processed.get("OIL"))
     vix = processed.get("VIX", {}).get("Close", pd.Series([20])).iloc[-1]
 
     assets = ["0050", "00631L", "00662", "00646", "00735", "6770"]
-    results = {k: analyze(processed.get(k), vix, market_state) for k in assets}
+    results = {
+        k: analyze(processed.get(k), vix, market_state, macro_state)
+        for k in assets
+    }
 
     bull_flags = {}
     for k in assets:
@@ -283,8 +334,9 @@ def run():
     tz = timezone(timedelta(hours=8))
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
 
-    msg = f"📊 V10.4 QUANT REPORT ({now})\n"
-    msg += f"\n🌍 市場狀態：{market_state}（{market_label(market_state)}） | VIX:{vix:.1f}\n"
+    msg = f"📊 V10.5 QUANT REPORT ({now})\n"
+    msg += f"\n🌍 市場：{market_state}（{market_label(market_state)}）"
+    msg += f"\n🌐 宏觀：{macro_state}（{macro_label(macro_state)}） | VIX:{vix:.1f}\n"
 
     hot = [k for k, v in bull_flags.items() if v]
     if hot:

@@ -7,7 +7,7 @@ import os
 STATE_FILE = "state.json"
 
 # =========================
-# State
+# STATE
 # =========================
 
 def load_state():
@@ -26,30 +26,30 @@ def save_state(state):
         json.dump(state, f)
 
 # =========================
-# Data Safety Layer（V11.1核心）
+# DATA LAYER (V11.2 CORE)
 # =========================
 
 def fetch_data(ticker):
     try:
         df = yf.download(ticker, period="6mo", progress=False)
 
-        # ❗ MultiIndex 修復（關鍵）
+        # flatten MultiIndex
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        # ❗ 空資料保護
+        # 必要欄位檢查
+        required = ["Close", "High", "Low", "Volume"]
         if df is None or df.empty:
             return None
 
-        # ❗ 必要欄位檢查
-        required = ["Close", "High", "Low", "Volume"]
         for col in required:
             if col not in df.columns:
                 return None
 
         df = df.dropna()
 
-        if len(df) < 100:
+        # 最低資料門檻（關鍵）
+        if len(df) < 80:
             return None
 
         return df
@@ -59,7 +59,7 @@ def fetch_data(ticker):
         return None
 
 # =========================
-# Indicators（穩定版）
+# INDICATORS (SAFE MODE)
 # =========================
 
 def add_indicators(df):
@@ -71,7 +71,7 @@ def add_indicators(df):
     df["MA20"] = pd.Series(close).rolling(20).mean()
     df["MA60"] = pd.Series(close).rolling(60).mean()
 
-    # ===== OBV (numpy safe) =====
+    # OBV safe numpy
     obv = np.zeros(len(df))
 
     for i in range(1, len(df)):
@@ -87,7 +87,7 @@ def add_indicators(df):
     return df
 
 # =========================
-# Risk Engine（V10.6）
+# RISK ENGINE (V10.6)
 # =========================
 
 def get_risk_cap():
@@ -113,23 +113,40 @@ def get_risk_cap():
         return 0.5, "UNKNOWN"
 
 # =========================
-# Trend Engine
+# TREND ENGINE (HARD SAFE)
 # =========================
 
 def is_trending_up(df):
-    close = df["Close"].iloc[-1]
 
-    cond1 = close > df["MA20"].iloc[-1] > df["MA60"].iloc[-1]
-    cond2 = close > df["High"].rolling(20).max().iloc[-2]
-    cond3 = df["OBV"].iloc[-1] > df["OBV"].rolling(20).mean().iloc[-1]
+    if df is None or len(df) < 60:
+        return False
 
-    return cond1 and cond2 and cond3
+    try:
+        close = df["Close"].iloc[-1]
+
+        ma20 = df["MA20"].iloc[-1]
+        ma60 = df["MA60"].iloc[-1]
+
+        if np.isnan(close) or np.isnan(ma20) or np.isnan(ma60):
+            return False
+
+        cond1 = close > ma20 > ma60
+
+        cond2 = close > df["High"].rolling(20).max().iloc[-2]
+
+        cond3 = df["OBV"].iloc[-1] > df["OBV"].rolling(20).mean().iloc[-1]
+
+        return cond1 and cond2 and cond3
+
+    except:
+        return False
 
 # =========================
-# Add logic
+# ADD CONDITION
 # =========================
 
 def should_add(df, last_price):
+
     price = df["Close"].iloc[-1]
 
     if last_price == 0:
@@ -142,10 +159,11 @@ def should_add(df, last_price):
     )
 
 # =========================
-# Risk control
+# RISK CONTROL
 # =========================
 
 def risk_control(df, entry_price):
+
     price = df["Close"].iloc[-1]
 
     if price < df["MA20"].iloc[-1]:
@@ -157,7 +175,7 @@ def risk_control(df, entry_price):
     return "HOLD"
 
 # =========================
-# Position system
+# POSITION MODEL
 # =========================
 
 POSITION_STAGES = {
@@ -168,7 +186,7 @@ POSITION_STAGES = {
 }
 
 # =========================
-# Main
+# MAIN ENGINE
 # =========================
 
 def run():
@@ -178,20 +196,29 @@ def run():
     df = fetch_data(ticker)
 
     if df is None:
-        print("❌ Data invalid or empty - skip run")
+        print("❌ Data invalid (fetch_data failed)")
         return
 
     df = add_indicators(df)
-    df = df.dropna()
+
+    # ===== DATA CONTRACT CHECK (V11.2 핵심) =====
+    if df is None or df.empty:
+        print("❌ Empty dataframe after indicators")
+        return
+
+    if len(df) < 80:
+        print(f"❌ Not enough data: {len(df)}")
+        return
 
     state = load_state()
 
     risk_cap, risk_status = get_risk_cap()
+
     trend = is_trending_up(df)
     risk = risk_control(df, state["entry_price"])
 
-    action = "HOLD"
     price = df["Close"].iloc[-1]
+    action = "HOLD"
 
     # =========================
     # ENTRY
@@ -203,7 +230,7 @@ def run():
         action = "INITIAL_ENTRY"
 
     # =========================
-    # EXIT / REDUCE
+    # EXIT
     # =========================
     elif risk == "REDUCE":
         state = {
@@ -236,17 +263,17 @@ def run():
     save_state(state)
 
     # =========================
-    # Output
+    # OUTPUT
     # =========================
 
-    print("===== V11.1 SIGNAL =====")
+    print("===== V11.2 SIGNAL =====")
     print(f"Ticker: {ticker}")
-    print(f"Price: {price:.2f}")
+    print(f"Price: {round(price,2)}")
     print(f"Risk: {risk_status} ({risk_cap})")
     print(f"Trend: {trend}")
     print(f"Action: {action}")
     print(f"Stage: {state['stage']}")
-    print(f"Position: {round(position*100, 2)}%")
+    print(f"Position: {round(position*100,2)}%")
 
 # =========================
 

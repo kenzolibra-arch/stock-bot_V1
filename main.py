@@ -1,4 +1,4 @@
-# === V10.5 QUANT ENGINE (MACRO FILTER ADDED) ===
+# === V10.6 QUANT ENGINE (MACRO POSITION CONTROL) ===
 import yfinance as yf
 import pandas as pd
 import ta
@@ -6,43 +6,17 @@ import requests
 import os
 from datetime import datetime, timezone, timedelta
 
-# =========================
-# SAFE DOWNLOAD
-# =========================
 def safe_download(ticker):
     try:
         df = yf.download(ticker, period="1y", interval="1d", progress=False, threads=False)
         if df is None or df.empty:
             return None
-
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-
         return df.dropna()
     except:
         return None
 
-
-# =========================
-# SPLIT FIX
-# =========================
-def fix_00631L_split(df):
-    try:
-        if len(df) < 50:
-            return df
-
-        if df["Close"].max() / df["Close"].iloc[-1] > 10:
-            mask = df["Close"] > df["Close"].iloc[-1] * 5
-            df.loc[mask, "Close"] /= 22
-
-        return df
-    except:
-        return df
-
-
-# =========================
-# DATA
-# =========================
 def get_data():
     assets = {
         "0050": "0050.TW",
@@ -57,27 +31,15 @@ def get_data():
         "DXY": "DX-Y.NYB",
         "OIL": "CL=F"
     }
-
     data = {}
     for k, v in assets.items():
         df = safe_download(v)
-        if df is None:
-            continue
-
-        if k == "00631L":
-            df = fix_00631L_split(df)
-
-        data[k] = df
-
+        if df is not None:
+            data[k] = df
     return data
 
-
-# =========================
-# INDICATORS
-# =========================
 def add_indicators(df):
     close = df["Close"]
-
     df["MA10"] = close.rolling(10).mean()
     df["MA20"] = close.rolling(20).mean()
 
@@ -87,80 +49,48 @@ def add_indicators(df):
 
     df["RSI"] = ta.momentum.RSIIndicator(close, 14).rsi()
     df["DEV"] = (close - df["MA10"]) / df["MA10"]
-
     df["OBV"] = ta.volume.OnBalanceVolumeIndicator(close, df["Volume"]).on_balance_volume()
 
     return df.dropna()
 
+def trend(df):
+    close = df["Close"]
+    ma20 = close.rolling(20).mean()
+    return close.iloc[-1] > ma20.iloc[-1]
 
-# =========================
-# 🌍 市場濾網
-# =========================
-def get_market_state(nasdaq_df, sox_df):
-    def trend(df):
-        close = df["Close"]
-        ma20 = close.rolling(20).mean()
-        return close.iloc[-1] > ma20.iloc[-1]
-
+def get_market_state(n, s):
     try:
-        n = trend(nasdaq_df)
-        s = trend(sox_df)
-
-        if n and s:
+        if trend(n) and trend(s):
             return "STRONG_BULL"
-        elif not n and not s:
+        elif not trend(n) and not trend(s):
             return "BEAR"
         else:
             return "MIXED"
     except:
         return "UNKNOWN"
 
-
-def market_label(s):
-    return {
-        "STRONG_BULL": "多頭共振",
-        "MIXED": "分歧震盪",
-        "BEAR": "空頭風險"
-    }.get(s, "")
-
-
-# =========================
-# 🌐 宏觀濾網（新增）
-# =========================
-def get_macro_state(dxy_df, oil_df):
+def get_macro_state(dxy, oil):
     try:
-        def up(df):
-            close = df["Close"]
-            ma20 = close.rolling(20).mean()
-            return close.iloc[-1] > ma20.iloc[-1]
-
-        dxy_up = up(dxy_df)
-        oil_up = up(oil_df)
-
-        if not dxy_up and not oil_up:
+        d = trend(dxy)
+        o = trend(oil)
+        if not d and not o:
             return "RISK_ON"
-        elif dxy_up and oil_up:
+        elif d and o:
             return "RISK_OFF"
         else:
             return "NEUTRAL"
     except:
         return "UNKNOWN"
 
-
-def macro_label(s):
+# 🔥 倉位上限控制
+def get_position_cap(macro_state):
     return {
-        "RISK_ON": "資金寬鬆",
-        "RISK_OFF": "資金收縮",
-        "NEUTRAL": "中性"
-    }.get(s, "")
+        "RISK_ON": 40,
+        "NEUTRAL": 30,
+        "RISK_OFF": 20
+    }.get(macro_state, 25)
 
-
-# =========================
-# SCORE ENGINE（加入宏觀）
-# =========================
-def score_engine(rsi, dev, price, ma10, bb_up, bb_low,
-                 vix, chip, market_state, macro_state):
-
+def score_engine(price, ma10, rsi, dev, bb_up, bb_low, vix, market_state, macro_state):
     score = 50
 
     score += 10 if price > ma10 else -10
@@ -170,71 +100,30 @@ def score_engine(rsi, dev, price, ma10, bb_up, bb_low,
     elif rsi > 75:
         score -= 20
 
-    if dev > 0.05:
-        score -= 15
-    elif dev < -0.05:
+    if dev < -0.05:
         score += 15
+    elif dev > 0.05:
+        score -= 15
 
-    # 動態布林
     if price < bb_low:
         score += 10
     elif price > bb_up:
-        if market_state == "STRONG_BULL":
-            score += 5
-        elif market_state == "BEAR":
-            score -= 20
-        else:
-            score -= 10
+        score += 5 if market_state == "STRONG_BULL" else -10
 
     if vix > 25:
         score *= 0.7
 
-    # 市場濾網
     if market_state == "BEAR":
         score -= 15
-    elif market_state == "MIXED":
-        score -= 5
 
-    # 🌐 宏觀濾網（新增）
     if macro_state == "RISK_OFF":
         score -= 10
     elif macro_state == "RISK_ON":
         score += 5
 
-    score += 10 if chip else -5
-
     return max(0, min(100, score))
 
-
-# =========================
-# 主升段（不被宏觀干擾）
-# =========================
-def is_bull_run(df, score, vix, market_state, is_stock=False):
-    try:
-        ma10_now = df["MA10"].iloc[-1]
-        ma10_prev = df["MA10"].iloc[-2]
-
-        obv_now = df["OBV"].iloc[-1]
-        obv_prev = df["OBV"].iloc[-2]
-
-        th = 85 if is_stock else 80
-
-        return (
-            score >= th and
-            df["Close"].iloc[-1] > ma10_now and
-            ma10_now > ma10_prev and
-            obv_now > obv_prev and
-            vix < 22 and
-            market_state != "BEAR"
-        )
-    except:
-        return False
-
-
-# =========================
-# ANALYZE
-# =========================
-def analyze(df, vix, market_state, macro_state):
+def analyze(df, vix, market_state, macro_state, cap):
     if df is None or len(df) < 30:
         return None
 
@@ -242,21 +131,13 @@ def analyze(df, vix, market_state, macro_state):
     ma10 = df["MA10"].iloc[-1]
     rsi = df["RSI"].iloc[-1]
     dev = df["DEV"].iloc[-1]
-
     bb_up = df["BB_UPPER"].iloc[-1]
     bb_low = df["BB_LOWER"].iloc[-1]
 
-    obv_now = df["OBV"].iloc[-1]
-    obv_ma = df["OBV"].rolling(5).mean().iloc[-1]
-    chip = obv_now > obv_ma
+    score = score_engine(price, ma10, rsi, dev, bb_up, bb_low, vix, market_state, macro_state)
 
-    score = score_engine(
-        rsi, dev, price, ma10,
-        bb_up, bb_low,
-        vix, chip,
-        market_state,
-        macro_state
-    )
+    raw_pos = int(score / 100 * 40)
+    pos = min(raw_pos, cap)  # 🔥 核心升級
 
     tag = (
         "🚀 主升段" if score >= 80 else
@@ -270,80 +151,49 @@ def analyze(df, vix, market_state, macro_state):
         "price": price,
         "score": score,
         "tag": tag,
-        "pos": int(min(score / 100 * 40, 40)),
+        "pos": pos,
+        "cap": cap,
         "stop": ma10 * 0.95,
         "rsi": rsi,
-        "chip": chip,
         "bb_up": bb_up,
         "bb_low": bb_low
     }
 
-
-# =========================
-# FORMAT
-# =========================
-def format_block(name, res, bull=False):
-    if res is None:
+def format_block(name, r):
+    if r is None:
         return f"\n📊 {name}\n❌ 無資料\n"
-
-    flag = "🚀 主升段狙擊\n" if bull else ""
-
     return f"""
 📊 {name}
-{flag}
-🏷️ {res['tag']} ({res['score']:.0f})
-💰 {res['price']:.2f}
-RSI:{res['rsi']:.1f} | 籌碼:{'強' if res['chip'] else '弱'}
-📦 倉位:{res['pos']}%
-📉 下軌:{res['bb_low']:.2f} | 📈 上軌:{res['bb_up']:.2f}
-🛑 停損:{res['stop']:.2f}
+🏷️ {r['tag']} ({r['score']:.0f})
+💰 {r['price']:.2f}
+RSI:{r['rsi']:.1f}
+📦 倉位:{r['pos']}%（上限{r['cap']}%）
+📉 下軌:{r['bb_low']:.2f} | 📈 上軌:{r['bb_up']:.2f}
+🛑 停損:{r['stop']:.2f}
 """
 
-
-# =========================
-# MAIN
-# =========================
 def run():
     data = get_data()
-    processed = {k: add_indicators(v) for k, v in data.items() if v is not None}
+    p = {k: add_indicators(v) for k, v in data.items() if v is not None}
 
-    market_state = get_market_state(processed.get("NASDAQ"), processed.get("SOX"))
-    macro_state = get_macro_state(processed.get("DXY"), processed.get("OIL"))
-    vix = processed.get("VIX", {}).get("Close", pd.Series([20])).iloc[-1]
+    market = get_market_state(p.get("NASDAQ"), p.get("SOX"))
+    macro = get_macro_state(p.get("DXY"), p.get("OIL"))
+    cap = get_position_cap(macro)
+
+    vix = p.get("VIX", {}).get("Close", pd.Series([20])).iloc[-1]
 
     assets = ["0050", "00631L", "00662", "00646", "00735", "6770"]
-    results = {
-        k: analyze(processed.get(k), vix, market_state, macro_state)
-        for k in assets
-    }
-
-    bull_flags = {}
-    for k in assets:
-        bull_flags[k] = (
-            k in processed and
-            results[k] is not None and
-            is_bull_run(
-                processed[k],
-                results[k]["score"],
-                vix,
-                market_state,
-                is_stock=(k == "6770")
-            )
-        )
+    results = {k: analyze(p.get(k), vix, market, macro, cap) for k in assets}
 
     tz = timezone(timedelta(hours=8))
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
 
-    msg = f"📊 V10.5 QUANT REPORT ({now})\n"
-    msg += f"\n🌍 市場：{market_state}（{market_label(market_state)}）"
-    msg += f"\n🌐 宏觀：{macro_state}（{macro_label(macro_state)}） | VIX:{vix:.1f}\n"
-
-    hot = [k for k, v in bull_flags.items() if v]
-    if hot:
-        msg += "\n🚀【主升段清單】\n" + " / ".join(hot) + "\n"
+    msg = f"📊 V10.6 QUANT REPORT ({now})\n"
+    msg += f"\n🌍 市場：{market}"
+    msg += f"\n🌐 宏觀：{macro}｜倉位上限：{cap}% | VIX:{vix:.1f}\n"
 
     for k in assets:
-        msg += format_block(k, results[k], bull_flags[k])
+        msg += format_block(k, results[k])
 
     token = os.getenv("BOT_TOKEN")
     chat_id = os.getenv("CHAT_ID")
@@ -353,10 +203,7 @@ def run():
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    res = requests.get(url, params={"chat_id": chat_id, "text": msg}, timeout=10)
-
-    print("✅ sent" if res.status_code == 200 else res.text)
-
+    requests.get(url, params={"chat_id": chat_id, "text": msg}, timeout=10)
 
 if __name__ == "__main__":
     run()

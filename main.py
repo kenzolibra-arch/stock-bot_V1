@@ -1,4 +1,4 @@
-# === V10.8 QUANT ENGINE (EXIT ENGINE UPGRADE) ===
+# === V10.9 QUANT ENGINE (DATA ENGINE STABLE VERSION) ===
 
 import yfinance as yf
 import pandas as pd
@@ -16,11 +16,80 @@ STATE_FILE = "state.json"
 
 STATE_DESC = {
     "FLAT": "0（空倉狀態）",
-    "ENTRY": "0.2（試單 / 初始進場）",
+    "ENTRY": "0.2（試單）",
     "ADD_1": "0.3（確認趨勢加碼）",
     "ADD_2": "0.4（主升段加碼）",
-    "FULL": "1.0（滿倉 / 趨勢極限）"
+    "FULL": "1.0（滿倉）"
 }
+
+# =====================================================
+# SAFE DATA ENGINE (CORE FIX)
+# =====================================================
+
+def clean_series(x):
+    """
+    🧠 V10.9 핵心：統一 1D data
+    """
+    if isinstance(x, pd.DataFrame):
+        x = x.iloc[:, 0]
+    return pd.Series(x).squeeze()
+
+def safe_download(ticker):
+    try:
+        df = yf.download(
+            ticker,
+            period="1y",
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+            threads=False
+        )
+
+        if df is None or df.empty:
+            return None
+
+        # remove multiindex
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df = df.dropna()
+
+        return df
+
+    except:
+        return None
+
+# =====================================================
+# INDICATORS (FIXED)
+# =====================================================
+
+def add_indicators(df):
+
+    df = df.copy()
+
+    close = clean_series(df["Close"])
+    volume = clean_series(df["Volume"])
+
+    # --- MA ---
+    df["MA10"] = close.rolling(10).mean()
+    df["MA20"] = close.rolling(20).mean()
+
+    # --- RSI (FIXED) ---
+    df["RSI"] = ta.momentum.RSIIndicator(close.to_numpy(), window=14).rsi()
+
+    # --- OBV (FIXED) ---
+    df["OBV"] = ta.volume.OnBalanceVolumeIndicator(
+        close, volume
+    ).on_balance_volume()
+
+    # --- DEV ---
+    df["DEV"] = (close - df["MA10"]) / df["MA10"]
+
+    return df.dropna()
+
+# =====================================================
+# STATE ENGINE
+# =====================================================
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -31,86 +100,7 @@ def save_state(s):
     json.dump(s, open(STATE_FILE, "w"))
 
 # =====================================================
-# POSITION STATE MACHINE (UP + DOWN)
-# =====================================================
-
-def update_state(state, ticker, score, trend_broken):
-
-    if ticker not in state:
-        state[ticker] = "FLAT"
-
-    current = state[ticker]
-
-    # =========================
-    # DOWNGRADE LOGIC (NEW)
-    # =========================
-
-    if trend_broken or score < 40:
-        if current == "FULL":
-            new_state = "ADD_2"
-        elif current == "ADD_2":
-            new_state = "ADD_1"
-        elif current == "ADD_1":
-            new_state = "ENTRY"
-        else:
-            new_state = "FLAT"
-        state[ticker] = new_state
-        return state, new_state
-
-    # =========================
-    # UPGRADE LOGIC
-    # =========================
-
-    if score >= 80:
-        new_state = "FULL"
-    elif score >= 65:
-        new_state = "ADD_2"
-    elif score >= 50:
-        new_state = "ADD_1"
-    elif score >= 35:
-        new_state = "ENTRY"
-    else:
-        new_state = "FLAT"
-
-    state[ticker] = new_state
-    return state, new_state
-
-def position_map(state):
-    return {
-        "FLAT": 0,
-        "ENTRY": 0.2,
-        "ADD_1": 0.3,
-        "ADD_2": 0.4,
-        "FULL": 1.0
-    }.get(state, 0)
-
-# =====================================================
-# DATA
-# =====================================================
-
-def safe_download(ticker):
-    try:
-        df = yf.download(ticker, period="1y", interval="1d", progress=False)
-        if df is None or df.empty:
-            return None
-        return df.dropna()
-    except:
-        return None
-
-def add_indicators(df):
-
-    close = df["Close"]
-
-    df["MA10"] = close.rolling(10).mean()
-    df["MA20"] = close.rolling(20).mean()
-
-    df["RSI"] = ta.momentum.RSIIndicator(close, 14).rsi()
-    df["OBV"] = ta.volume.OnBalanceVolumeIndicator(close, df["Volume"]).on_balance_volume()
-
-    return df.dropna()
-
-# =====================================================
-# TREND BREAK DETECTION (NEW)
+# TREND BREAK (V10.8 LOGIC)
 # =====================================================
 
 def trend_broken(df):
@@ -119,6 +109,7 @@ def trend_broken(df):
         price = df["Close"].iloc[-1]
         ma20 = df["MA20"].iloc[-1]
         ma10 = df["MA10"].iloc[-1]
+
         obv = df["OBV"].iloc[-1]
         obv_ma = df["OBV"].rolling(20).mean().iloc[-1]
 
@@ -134,10 +125,10 @@ def trend_broken(df):
         return False
 
 # =====================================================
-# SCORE
+# SCORE ENGINE
 # =====================================================
 
-def score_engine(price, ma10, rsi, market_state, macro_state):
+def score_engine(price, ma10, rsi):
 
     score = 50
 
@@ -151,23 +142,68 @@ def score_engine(price, ma10, rsi, market_state, macro_state):
     if rsi < 50:
         score -= 10
 
-    if market_state == "BEAR":
-        score -= 15
-
-    if macro_state == "RISK_ON":
-        score += 5
-
     return max(0, min(100, score))
+
+# =====================================================
+# STATE MACHINE (V10.8 + SAFE DATA)
+# =====================================================
+
+def update_state(state, ticker, score, tb):
+
+    if ticker not in state:
+        state[ticker] = "FLAT"
+
+    cur = state[ticker]
+
+    # 🔴 EXIT LOGIC
+    if tb or score < 40:
+        if cur == "FULL":
+            new = "ADD_2"
+        elif cur == "ADD_2":
+            new = "ADD_1"
+        elif cur == "ADD_1":
+            new = "ENTRY"
+        else:
+            new = "FLAT"
+
+        state[ticker] = new
+        return state, new
+
+    # 🟢 ENTRY LOGIC
+    if score >= 80:
+        new = "FULL"
+    elif score >= 65:
+        new = "ADD_2"
+    elif score >= 50:
+        new = "ADD_1"
+    elif score >= 35:
+        new = "ENTRY"
+    else:
+        new = "FLAT"
+
+    state[ticker] = new
+    return state, new
+
+def position_map(s):
+    return {
+        "FLAT": 0,
+        "ENTRY": 0.2,
+        "ADD_1": 0.3,
+        "ADD_2": 0.4,
+        "FULL": 1.0
+    }.get(s, 0)
 
 # =====================================================
 # ANALYZE
 # =====================================================
 
-def analyze(df, score, state, ticker):
+def analyze(df, state, ticker):
 
     price = df["Close"].iloc[-1]
     ma10 = df["MA10"].iloc[-1]
     rsi = df["RSI"].iloc[-1]
+
+    score = score_engine(price, ma10, rsi)
 
     tb = trend_broken(df)
 
@@ -177,13 +213,13 @@ def analyze(df, score, state, ticker):
 
     signal = "HOLD"
     if tb:
-        signal = "🔴 TREND BROKEN / REDUCE"
-    elif pos_state == "FULL" and score < 70:
-        signal = "🔴 TAKE PROFIT"
+        signal = "🔴 TREND BROKEN"
+    elif pos_state == "FULL":
+        signal = "🟢 FULL TREND"
     elif pos_state == "ADD_2":
-        signal = "🟢 STRONG TREND"
+        signal = "🟢 STRONG"
     elif pos_state == "ENTRY":
-        signal = "🟡 BUILD POSITION"
+        signal = "🟡 ENTRY"
 
     return {
         "price": price,
@@ -191,34 +227,31 @@ def analyze(df, score, state, ticker):
         "state": pos_state,
         "pos": pos,
         "signal": signal,
-        "ma10": ma10,
         "rsi": rsi,
         "tb": tb
     }, state
 
 # =====================================================
-# FORMAT (IMPROVED SEPARATION)
+# FORMAT (clean separation)
 # =====================================================
 
 def format_block(name, r):
 
     if r is None:
-        return f"\n====================\n📊 {name}\n❌ 無資料\n"
+        return f"\n====================\n📊 {name}\n❌ NO DATA\n"
 
     return f"""
 ====================
 📊 {name}
 
-🏷️ State: {r['state']}
+🧠 State: {r['state']}
 📡 Signal: {r['signal']}
 
 💰 Price: {r['price']:.2f}
 📊 Score: {r['score']:.0f}
-📦 Position: {r['pos']}%
+📦 Pos: {r['pos']}%
 
-📉 MA10: {r['ma10']:.2f}
 📊 RSI: {r['rsi']:.1f}
-
 ⚠️ Trend Broken: {r['tb']}
 ====================
 """
@@ -239,24 +272,25 @@ def run():
     }
 
     data = {}
+
     for k, v in assets.items():
         df = safe_download(v)
         if df is not None:
-            data[k] = add_indicators(df)
+            df = add_indicators(df)
+            if df is not None and len(df) > 30:
+                data[k] = df
 
     state = load_state()
 
     results = {}
 
     for k, df in data.items():
-
-        score = 50  # simplified (可再接 macro V10.7)
-        res, state = analyze(df, score, state, k)
+        res, state = analyze(df, state, k)
         results[k] = res
 
     save_state(state)
 
-    msg = "📊 V10.8 EXIT ENGINE REPORT\n"
+    msg = "📊 V10.9 DATA ENGINE REPORT\n"
 
     for k in results:
         msg += format_block(k, results[k])

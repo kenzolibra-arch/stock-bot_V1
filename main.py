@@ -7,37 +7,39 @@ import requests
 
 STATE_FILE = "state.json"
 
-# =========================
-# TELEGRAM (CRON SAFE)
-# =========================
+# =====================================================
+# TELEGRAM (FIXED: BOT_TOKEN / CHAT_ID)
+# =====================================================
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
 
 def send_telegram(msg):
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Telegram not configured")
+        print("❌ Telegram not configured")
+        print("BOT_TOKEN:", TELEGRAM_TOKEN)
+        print("CHAT_ID:", TELEGRAM_CHAT_ID)
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": msg,
-        "parse_mode": "HTML"
+        "text": msg
     }
 
     try:
         r = requests.post(url, data=payload, timeout=10)
-        print("TG:", r.status_code)
+        print("📡 TG STATUS:", r.status_code)
+        print("📡 TG RESPONSE:", r.text)
 
     except Exception as e:
-        print("TG ERROR:", e)
+        print("❌ Telegram error:", e)
 
-# =========================
-# STATE (only persistence)
-# =========================
+# =====================================================
+# STATE
+# =====================================================
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -54,9 +56,9 @@ def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
-# =========================
+# =====================================================
 # DATA
-# =========================
+# =====================================================
 
 def fetch_data():
     df = yf.download("0050.TW", period="6mo", progress=False)
@@ -71,9 +73,9 @@ def fetch_data():
 
     return df
 
-# =========================
+# =====================================================
 # INDICATORS
-# =========================
+# =====================================================
 
 def add_indicators(df):
 
@@ -87,20 +89,20 @@ def add_indicators(df):
     obv = np.zeros(len(df))
 
     for i in range(1, len(df)):
-        if close[i] > close[i-1]:
-            obv[i] = obv[i-1] + volume[i]
-        elif close[i] < close[i-1]:
-            obv[i] = obv[i-1] - volume[i]
+        if close[i] > close[i - 1]:
+            obv[i] += obv[i - 1] + volume[i]
+        elif close[i] < close[i - 1]:
+            obv[i] += obv[i - 1] - volume[i]
         else:
-            obv[i] = obv[i-1]
+            obv[i] = obv[i - 1]
 
     df["OBV"] = obv
 
     return df
 
-# =========================
-# MARKET RISK (V10.6保留)
-# =========================
+# =====================================================
+# RISK ENGINE (V10.6)
+# =====================================================
 
 def get_risk_cap():
     try:
@@ -110,9 +112,13 @@ def get_risk_cap():
         if nasdaq.empty or vix.empty:
             return 0.5, "UNKNOWN"
 
-        if nasdaq["Close"].rolling(20).mean().iloc[-1] < nasdaq["Close"].iloc[-1] and vix["Close"].iloc[-1] < 20:
+        ma20 = nasdaq["Close"].rolling(20).mean().iloc[-1]
+        price = nasdaq["Close"].iloc[-1]
+        vix_val = vix["Close"].iloc[-1]
+
+        if price > ma20 and vix_val < 20:
             return 1.0, "RISK_ON"
-        elif vix["Close"].iloc[-1] > 25:
+        elif vix_val > 25:
             return 0.3, "RISK_OFF"
         else:
             return 0.6, "NEUTRAL"
@@ -120,9 +126,9 @@ def get_risk_cap():
     except:
         return 0.5, "UNKNOWN"
 
-# =========================
-# TREND
-# =========================
+# =====================================================
+# TREND ENGINE
+# =====================================================
 
 def is_trending(df):
 
@@ -141,9 +147,9 @@ def is_trending(df):
     except:
         return False
 
-# =========================
+# =====================================================
 # RISK CONTROL
-# =========================
+# =====================================================
 
 def risk_control(df, entry):
 
@@ -157,9 +163,9 @@ def risk_control(df, entry):
 
     return "HOLD"
 
-# =========================
+# =====================================================
 # POSITION MAP
-# =========================
+# =====================================================
 
 POSITION_MAP = {
     "FLAT": 0,
@@ -169,19 +175,39 @@ POSITION_MAP = {
     "FULL": 1.0
 }
 
-# =========================
-# MAIN (CRON SAFE)
-# =========================
+# =====================================================
+# STATE MACHINE
+# =====================================================
 
-print("TOKEN:", TELEGRAM_TOKEN)
-print("CHAT_ID:", TELEGRAM_CHAT_ID)
+def next_state(current, trend, risk):
+
+    if risk == "LIQUIDATE":
+        return "FLAT"
+
+    if current == "FLAT" and trend:
+        return "ENTRY"
+
+    if current == "ENTRY":
+        return "ADD_1"
+
+    if current == "ADD_1":
+        return "ADD_2"
+
+    if current == "ADD_2":
+        return "FULL"
+
+    return current
+
+# =====================================================
+# MAIN
+# =====================================================
 
 def run():
 
     df = fetch_data()
 
     if df is None:
-        print("No data")
+        print("❌ No data")
         return
 
     df = add_indicators(df)
@@ -192,47 +218,28 @@ def run():
 
     trend = is_trending(df)
 
-    risk_signal = risk_control(df, state["entry_price"])
+    risk = risk_control(df, state["entry_price"])
 
     price = df["Close"].iloc[-1]
 
-    # =========================
-    # STATE UPDATE (safe)
-    # =========================
+    new_state = next_state(state["position_state"], trend, risk)
 
-    new_state = state["position_state"]
+    # entry handling
+    if state["position_state"] == "FLAT" and new_state == "ENTRY":
+        state["entry_price"] = price
 
-    if risk_signal == "LIQUIDATE":
-        new_state = "FLAT"
-
-    elif state["position_state"] == "FLAT" and trend:
-        new_state = "ENTRY"
-
-    elif state["position_state"] == "ENTRY":
-        new_state = "ADD_1"
-
-    elif state["position_state"] == "ADD_1":
-        new_state = "ADD_2"
-
-    elif state["position_state"] == "ADD_2":
-        new_state = "FULL"
-
-    # update state
     if new_state == "FLAT":
         state["entry_price"] = 0
         state["last_add_price"] = 0
-    elif state["position_state"] == "FLAT" and new_state == "ENTRY":
-        state["entry_price"] = price
+
+    if new_state in ["ADD_1", "ADD_2"]:
+        state["last_add_price"] = price
 
     state["position_state"] = new_state
 
     save_state(state)
 
     position = POSITION_MAP[new_state] * risk_cap
-
-    # =========================
-    # CRON OUTPUT (ONLY ONCE)
-    # =========================
 
     msg = f"""
 📊 V10.7 CRON REPORT
@@ -243,14 +250,14 @@ Trend: {trend}
 Risk: {risk_status}
 
 Position: {round(position*100,2)}%
-Signal: {risk_signal}
+Signal: {risk}
 """
 
     print(msg)
 
     send_telegram(msg)
 
-# =========================
+# =====================================================
 
 if __name__ == "__main__":
     run()

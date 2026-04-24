@@ -1,4 +1,4 @@
-# === V10.9 QUANT ENGINE (DATA ENGINE STABLE VERSION) ===
+# === V10.9 QUANT ENGINE (FULL CHINESE REPORT + DATA ENGINE) ===
 
 import yfinance as yf
 import pandas as pd
@@ -11,28 +11,42 @@ from datetime import datetime, timezone, timedelta
 STATE_FILE = "state.json"
 
 # =====================================================
-# STATE
+# 中文狀態說明
 # =====================================================
 
 STATE_DESC = {
     "FLAT": "0（空倉狀態）",
-    "ENTRY": "0.2（試單）",
+    "ENTRY": "0.2（試單 / 初始進場）",
     "ADD_1": "0.3（確認趨勢加碼）",
     "ADD_2": "0.4（主升段加碼）",
-    "FULL": "1.0（滿倉）"
+    "FULL": "1.0（滿倉 / 趨勢極限）"
+}
+
+SIGNAL_DESC = {
+    "HOLD": "觀望",
+    "🟡 ENTRY": "試單 / 初始進場",
+    "🟢 STRONG": "趨勢強勢",
+    "🟢 FULL TREND": "主升段",
+    "🔴 TREND BROKEN": "趨勢破壞 / 減碼",
+    "🔴 TAKE PROFIT": "獲利了結"
+}
+
+MARKET_DESC = {
+    "STRONG_BULL": "多頭趨勢（科技+半導體同步強勢）",
+    "BEAR": "空頭趨勢（風險資產走弱）",
+    "MIXED": "分歧市場（結構不一致）",
+    "UNKNOWN": "未知狀態"
+}
+
+MACRO_DESC = {
+    "RISK_ON": "資金寬鬆（流動性充裕，偏多環境）",
+    "RISK_OFF": "資金收縮（風險升高，防禦環境）",
+    "NEUTRAL": "中性環境（無明確方向）"
 }
 
 # =====================================================
-# SAFE DATA ENGINE (CORE FIX)
+# DATA ENGINE（穩定版）
 # =====================================================
-
-def clean_series(x):
-    """
-    🧠 V10.9 핵心：統一 1D data
-    """
-    if isinstance(x, pd.DataFrame):
-        x = x.iloc[:, 0]
-    return pd.Series(x).squeeze()
 
 def safe_download(ticker):
     try:
@@ -48,69 +62,46 @@ def safe_download(ticker):
         if df is None or df.empty:
             return None
 
-        # remove multiindex
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        df = df.dropna()
-
-        return df
+        return df.dropna()
 
     except:
         return None
 
-# =====================================================
-# INDICATORS (FIXED)
-# =====================================================
 
 def add_indicators(df):
 
     df = df.copy()
 
     close = df["Close"]
+    volume = df["Volume"]
 
-    # ✅ 強制 Series（關鍵）
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
-
-    close = pd.Series(close).astype(float)
-
-    volume = df["Volume"]
 
     if isinstance(volume, pd.DataFrame):
         volume = volume.iloc[:, 0]
 
+    close = pd.Series(close).astype(float)
     volume = pd.Series(volume).astype(float)
-
-    # =====================
-    # INDICATORS (FIXED)
-    # =====================
 
     df["MA10"] = close.rolling(10).mean()
     df["MA20"] = close.rolling(20).mean()
 
-    # ✅ RSI FIX (IMPORTANT)
     df["RSI"] = ta.momentum.RSIIndicator(close, window=14).rsi()
 
-    # OBV
-    df["OBV"] = ta.volume.OnBalanceVolumeIndicator(close, volume).on_balance_volume()
+    df["OBV"] = ta.volume.OnBalanceVolumeIndicator(
+        close, volume
+    ).on_balance_volume()
+
+    df["DEV"] = (close - df["MA10"]) / df["MA10"]
 
     return df.dropna()
 
 # =====================================================
-# STATE ENGINE
-# =====================================================
-
-def load_state():
-    if os.path.exists(STATE_FILE):
-        return json.load(open(STATE_FILE))
-    return {}
-
-def save_state(s):
-    json.dump(s, open(STATE_FILE, "w"))
-
-# =====================================================
-# TREND BREAK (V10.8 LOGIC)
+# 趨勢破壞判斷
 # =====================================================
 
 def trend_broken(df):
@@ -155,8 +146,16 @@ def score_engine(price, ma10, rsi):
     return max(0, min(100, score))
 
 # =====================================================
-# STATE MACHINE (V10.8 + SAFE DATA)
+# STATE ENGINE
 # =====================================================
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        return json.load(open(STATE_FILE))
+    return {}
+
+def save_state(s):
+    json.dump(s, open(STATE_FILE, "w"))
 
 def update_state(state, ticker, score, tb):
 
@@ -165,7 +164,6 @@ def update_state(state, ticker, score, tb):
 
     cur = state[ticker]
 
-    # 🔴 EXIT LOGIC
     if tb or score < 40:
         if cur == "FULL":
             new = "ADD_2"
@@ -175,24 +173,21 @@ def update_state(state, ticker, score, tb):
             new = "ENTRY"
         else:
             new = "FLAT"
-
-        state[ticker] = new
-        return state, new
-
-    # 🟢 ENTRY LOGIC
-    if score >= 80:
-        new = "FULL"
-    elif score >= 65:
-        new = "ADD_2"
-    elif score >= 50:
-        new = "ADD_1"
-    elif score >= 35:
-        new = "ENTRY"
     else:
-        new = "FLAT"
+        if score >= 80:
+            new = "FULL"
+        elif score >= 65:
+            new = "ADD_2"
+        elif score >= 50:
+            new = "ADD_1"
+        elif score >= 35:
+            new = "ENTRY"
+        else:
+            new = "FLAT"
 
     state[ticker] = new
     return state, new
+
 
 def position_map(s):
     return {
@@ -227,7 +222,7 @@ def analyze(df, state, ticker):
     elif pos_state == "FULL":
         signal = "🟢 FULL TREND"
     elif pos_state == "ADD_2":
-        signal = "🟢 STRONG"
+        signal = "🟢 STRONG TREND"
     elif pos_state == "ENTRY":
         signal = "🟡 ENTRY"
 
@@ -242,27 +237,35 @@ def analyze(df, state, ticker):
     }, state
 
 # =====================================================
-# FORMAT (clean separation)
+# FORMAT (中文報告版)
 # =====================================================
 
 def format_block(name, r):
 
     if r is None:
-        return f"\n====================\n📊 {name}\n❌ NO DATA\n"
+        return f"\n====================\n📊 {name}\n❌ 無資料\n"
+
+    # ===== 趨勢破壞中文說明 =====
+    tb_text = (
+        "否（仍然完整，可持有/加碼）"
+        if not r['tb']
+        else "是（已破壞，應減碼/出場）"
+    )
 
     return f"""
 ====================
 📊 {name}
 
-🧠 State: {r['state']}
-📡 Signal: {r['signal']}
+🏷️ 狀態: {r['state']} - {STATE_DESC.get(r['state'], "")}
+📡 訊號: {SIGNAL_DESC.get(r['signal'], r['signal'])}
 
-💰 Price: {r['price']:.2f}
-📊 Score: {r['score']:.0f}
-📦 Pos: {r['pos']}%
+💰 價格: {r['price']:.2f}
+📊 分數: {r['score']:.0f}
+📦 倉位: {r['pos']}%
 
 📊 RSI: {r['rsi']:.1f}
-⚠️ Trend Broken: {r['tb']}
+
+⚠️ 趨勢破壞: {tb_text}
 ====================
 """
 
@@ -300,7 +303,13 @@ def run():
 
     save_state(state)
 
-    msg = "📊 V10.9 DATA ENGINE REPORT\n"
+    tz = timezone(timedelta(hours=8))
+    now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
+
+    msg = f"""
+📊 V10.9 QUANT REPORT ({now})
+
+"""
 
     for k in results:
         msg += format_block(k, results[k])

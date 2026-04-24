@@ -67,23 +67,33 @@ def add_indicators(df):
 
     df = df.copy()
 
-    close = clean_series(df["Close"])
-    volume = clean_series(df["Volume"])
+    close = df["Close"]
 
-    # --- MA ---
+    # ✅ 強制 Series（關鍵）
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+
+    close = pd.Series(close).astype(float)
+
+    volume = df["Volume"]
+
+    if isinstance(volume, pd.DataFrame):
+        volume = volume.iloc[:, 0]
+
+    volume = pd.Series(volume).astype(float)
+
+    # =====================
+    # INDICATORS (FIXED)
+    # =====================
+
     df["MA10"] = close.rolling(10).mean()
     df["MA20"] = close.rolling(20).mean()
 
-    # --- RSI (FIXED) ---
-    df["RSI"] = ta.momentum.RSIIndicator(close.to_numpy(), window=14).rsi()
+    # ✅ RSI FIX (IMPORTANT)
+    df["RSI"] = ta.momentum.RSIIndicator(close, window=14).rsi()
 
-    # --- OBV (FIXED) ---
-    df["OBV"] = ta.volume.OnBalanceVolumeIndicator(
-        close, volume
-    ).on_balance_volume()
-
-    # --- DEV ---
-    df["DEV"] = (close - df["MA10"]) / df["MA10"]
+    # OBV
+    df["OBV"] = ta.volume.OnBalanceVolumeIndicator(close, volume).on_balance_volume()
 
     return df.dropna()
 

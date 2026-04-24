@@ -1,4 +1,5 @@
-# === V10.7 QUANT ENGINE (V10.6 FULL + STATE MACHINE UPGRADE) ===
+# === V10.7 QUANT ENGINE (FULL EXPLAINED + CHIP FLOW LAYER) ===
+
 import yfinance as yf
 import pandas as pd
 import ta
@@ -10,8 +11,16 @@ from datetime import datetime, timezone, timedelta
 STATE_FILE = "state.json"
 
 # =====================================================
-# STATE MACHINE (NEW - V10.7)
+# STATE MACHINE
 # =====================================================
+
+STATE_DESC = {
+    "FLAT": "0（空倉狀態）",
+    "ENTRY": "0.2（試單 / 初始進場）",
+    "ADD_1": "0.3（確認趨勢加碼）",
+    "ADD_2": "0.4（主升段加碼）",
+    "FULL": "1.0（滿倉 / 趨勢極限）"
+}
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -22,9 +31,7 @@ def save_state(s):
     json.dump(s, open(STATE_FILE, "w"))
 
 def get_position_state(state, ticker, score):
-    """
-    state-aware position control (V10.7)
-    """
+
     if ticker not in state:
         state[ticker] = "FLAT"
 
@@ -54,12 +61,12 @@ def position_map(state):
     }.get(state, 0)
 
 # =====================================================
-# V10.6 ORIGINAL (UNCHANGED)
+# DATA
 # =====================================================
 
 def safe_download(ticker):
     try:
-        df = yf.download(ticker, period="1y", interval="1d", progress=False, threads=False)
+        df = yf.download(ticker, period="1y", interval="1d", progress=False)
         if df is None or df.empty:
             return None
         if isinstance(df.columns, pd.MultiIndex):
@@ -82,6 +89,7 @@ def get_data():
         "DXY": "DX-Y.NYB",
         "OIL": "CL=F"
     }
+
     data = {}
     for k, v in assets.items():
         df = safe_download(v)
@@ -90,7 +98,9 @@ def get_data():
     return data
 
 def add_indicators(df):
+
     close = df["Close"]
+
     df["MA10"] = close.rolling(10).mean()
     df["MA20"] = close.rolling(20).mean()
 
@@ -104,10 +114,12 @@ def add_indicators(df):
 
     return df.dropna()
 
+# =====================================================
+# MARKET / MACRO (V10.6 unchanged)
+# =====================================================
+
 def trend(df):
-    close = df["Close"]
-    ma20 = close.rolling(20).mean()
-    return close.iloc[-1] > ma20.iloc[-1]
+    return df["Close"].iloc[-1] > df["Close"].rolling(20).mean().iloc[-1]
 
 def get_market_state(n, s):
     try:
@@ -115,21 +127,17 @@ def get_market_state(n, s):
             return "STRONG_BULL"
         elif not trend(n) and not trend(s):
             return "BEAR"
-        else:
-            return "MIXED"
+        return "MIXED"
     except:
         return "UNKNOWN"
 
 def get_macro_state(dxy, oil):
     try:
-        d = trend(dxy)
-        o = trend(oil)
-        if not d and not o:
+        if not trend(dxy) and not trend(oil):
             return "RISK_ON"
-        elif d and o:
+        elif trend(dxy) and trend(oil):
             return "RISK_OFF"
-        else:
-            return "NEUTRAL"
+        return "NEUTRAL"
     except:
         return "UNKNOWN"
 
@@ -141,10 +149,11 @@ def get_position_cap(macro_state):
     }.get(macro_state, 25)
 
 # =====================================================
-# SCORE ENGINE (UNCHANGED V10.6)
+# SCORE ENGINE (UNCHANGED)
 # =====================================================
 
 def score_engine(price, ma10, rsi, dev, bb_up, bb_low, vix, market_state, macro_state):
+
     score = 50
 
     score += 10 if price > ma10 else -10
@@ -178,7 +187,47 @@ def score_engine(price, ma10, rsi, dev, bb_up, bb_low, vix, market_state, macro_
     return max(0, min(100, score))
 
 # =====================================================
-# ANALYZE (V10.6 + STATE OUTPUT)
+# 🆕 COST / FLOW STRENGTH LAYER
+# =====================================================
+
+def chip_strength(df):
+
+    try:
+        obv = df["OBV"].iloc[-1]
+        obv_ma = df["OBV"].rolling(20).mean().iloc[-1]
+
+        price = df["Close"].iloc[-1]
+        ma20 = df["MA20"].iloc[-1]
+
+        score = 50
+
+        if obv > obv_ma:
+            score += 25
+        else:
+            score -= 25
+
+        if price > ma20:
+            score += 20
+        else:
+            score -= 10
+
+        return max(0, min(100, score))
+
+    except:
+        return 50
+
+def chip_tag(s):
+
+    if s >= 75:
+        return "🔥 強勢吸籌"
+    elif s >= 60:
+        return "🟢 偏多流入"
+    elif s >= 40:
+        return "🟡 中性整理"
+    return "🔴 籌碼偏弱"
+
+# =====================================================
+# ANALYZE
 # =====================================================
 
 def analyze(df, vix, market_state, macro_state, cap, state, ticker):
@@ -195,11 +244,13 @@ def analyze(df, vix, market_state, macro_state, cap, state, ticker):
 
     score = score_engine(price, ma10, rsi, dev, bb_up, bb_low, vix, market_state, macro_state)
 
-    # ===== V10.7 STATE MACHINE =====
     state, pos_state = get_position_state(state, ticker, score)
 
     pos = min(int(score / 100 * 40), cap)
     pos = max(pos, int(position_map(pos_state) * cap))
+
+    chip = chip_strength(df)
+    chip_label = chip_tag(chip)
 
     tag = (
         "🚀 主升段" if score >= 80 else
@@ -219,14 +270,17 @@ def analyze(df, vix, market_state, macro_state, cap, state, ticker):
         "rsi": rsi,
         "bb_up": bb_up,
         "bb_low": bb_low,
-        "state": pos_state
+        "state": pos_state,
+        "chip": chip,
+        "chip_tag": chip_label
     }, state, pos_state
 
 # =====================================================
-# FORMAT (V10.6 保留 + V10.7 增強)
+# FORMAT
 # =====================================================
 
 def format_block(name, r):
+
     if r is None:
         return f"\n📊 {name}\n❌ 無資料\n"
 
@@ -234,9 +288,13 @@ def format_block(name, r):
 📊 {name}
 🏷️ {r['tag']} ({r['score']:.0f})
 💰 {r['price']:.2f}
-RSI:{r['rsi']:.1f}
+
 📦 倉位:{r['pos']}%（上限{r['cap']}%）
-🧠 狀態:{r['state']}
+🧠 狀態:{r['state']} - {STATE_DESC.get(r['state'], "")}
+
+📊 籌碼強度:{r['chip']} ({r['chip_tag']})
+
+RSI:{r['rsi']:.1f}
 📉 下軌:{r['bb_low']:.2f} | 📈 上軌:{r['bb_up']:.2f}
 🛑 停損:{r['stop']:.2f}
 """
@@ -261,8 +319,9 @@ def run():
     assets = ["0050", "00631L", "00662", "00646", "00735", "6770"]
 
     results = {}
+
     for k in assets:
-        res, state, pos_state = analyze(
+        res, state, _ = analyze(
             p.get(k),
             vix,
             market,

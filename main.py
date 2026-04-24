@@ -1,259 +1,303 @@
+# === V10.7 QUANT ENGINE (V10.6 FULL + STATE MACHINE UPGRADE) ===
 import yfinance as yf
 import pandas as pd
-import numpy as np
-import json
-import os
+import ta
 import requests
+import os
+import json
+from datetime import datetime, timezone, timedelta
 
 STATE_FILE = "state.json"
 
 # =====================================================
-# TELEGRAM
-# =====================================================
-
-TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
-
-def send_telegram(msg):
-
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("❌ Telegram not configured")
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
-    try:
-        r = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
-        print("TG:", r.status_code)
-
-    except Exception as e:
-        print("TG ERROR:", e)
-
-# =====================================================
-# STATE
+# STATE MACHINE (NEW - V10.7)
 # =====================================================
 
 def load_state():
     if os.path.exists(STATE_FILE):
         return json.load(open(STATE_FILE))
-
-    return {
-        "state": "FLAT",
-        "entry": 0
-    }
+    return {}
 
 def save_state(s):
     json.dump(s, open(STATE_FILE, "w"))
 
-# =====================================================
-# DATA
-# =====================================================
+def get_position_state(state, ticker, score):
+    """
+    state-aware position control (V10.7)
+    """
+    if ticker not in state:
+        state[ticker] = "FLAT"
 
-def fetch():
-    df = yf.download("0050.TW", period="6mo", progress=False)
+    s = state[ticker]
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    if score >= 80:
+        new_state = "FULL"
+    elif score >= 65:
+        new_state = "ADD_2"
+    elif score >= 50:
+        new_state = "ADD_1"
+    elif score >= 35:
+        new_state = "ENTRY"
+    else:
+        new_state = "FLAT"
 
-    df = df.dropna()
+    state[ticker] = new_state
+    return state, new_state
 
-    return df if len(df) > 80 else None
-
-# =====================================================
-# INDICATORS
-# =====================================================
-
-def add_ind(df):
-
-    c = df["Close"].values
-    v = df["Volume"].values
-
-    df["MA20"] = pd.Series(c).rolling(20).mean()
-    df["MA60"] = pd.Series(c).rolling(60).mean()
-
-    obv = np.zeros(len(df))
-
-    for i in range(1, len(df)):
-        if c[i] > c[i-1]:
-            obv[i] = obv[i-1] + v[i]
-        elif c[i] < c[i-1]:
-            obv[i] = obv[i-1] - v[i]
-        else:
-            obv[i] = obv[i-1]
-
-    df["OBV"] = obv
-
-    return df
+def position_map(state):
+    return {
+        "FLAT": 0,
+        "ENTRY": 0.2,
+        "ADD_1": 0.3,
+        "ADD_2": 0.4,
+        "FULL": 1.0
+    }.get(state, 0)
 
 # =====================================================
-# GLOBAL MARKET (V10.6保留)
+# V10.6 ORIGINAL (UNCHANGED)
 # =====================================================
 
-def market():
-
+def safe_download(ticker):
     try:
-        nq = yf.download("^IXIC", period="3mo", progress=False)
-        vix = yf.download("^VIX", period="1mo", progress=False)
-
-        nq_ma = nq["Close"].rolling(20).mean().iloc[-1]
-        nq_p = nq["Close"].iloc[-1]
-        v = vix["Close"].iloc[-1]
-
-        if nq_p > nq_ma and v < 20:
-            return 1.0, "RISK_ON"
-
-        if v > 25:
-            return 0.3, "RISK_OFF"
-
-        return 0.6, "NEUTRAL"
-
+        df = yf.download(ticker, period="1y", interval="1d", progress=False, threads=False)
+        if df is None or df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df.dropna()
     except:
-        return 0.5, "UNKNOWN"
+        return None
 
-# =====================================================
-# TREND
-# =====================================================
+def get_data():
+    assets = {
+        "0050": "0050.TW",
+        "00631L": "00631L.TW",
+        "00662": "00662.TW",
+        "00646": "00646.TW",
+        "00735": "00735.TW",
+        "6770": "6770.TW",
+        "NASDAQ": "^IXIC",
+        "SOX": "^SOX",
+        "VIX": "^VIX",
+        "DXY": "DX-Y.NYB",
+        "OIL": "CL=F"
+    }
+    data = {}
+    for k, v in assets.items():
+        df = safe_download(v)
+        if df is not None:
+            data[k] = df
+    return data
+
+def add_indicators(df):
+    close = df["Close"]
+    df["MA10"] = close.rolling(10).mean()
+    df["MA20"] = close.rolling(20).mean()
+
+    bb = ta.volatility.BollingerBands(close, 20, 2)
+    df["BB_UPPER"] = bb.bollinger_hband()
+    df["BB_LOWER"] = bb.bollinger_lband()
+
+    df["RSI"] = ta.momentum.RSIIndicator(close, 14).rsi()
+    df["DEV"] = (close - df["MA10"]) / df["MA10"]
+    df["OBV"] = ta.volume.OnBalanceVolumeIndicator(close, df["Volume"]).on_balance_volume()
+
+    return df.dropna()
 
 def trend(df):
+    close = df["Close"]
+    ma20 = close.rolling(20).mean()
+    return close.iloc[-1] > ma20.iloc[-1]
 
+def get_market_state(n, s):
     try:
-        c = df["Close"].iloc[-1]
-
-        return (
-            c > df["MA20"].iloc[-1] > df["MA60"].iloc[-1]
-            and df["OBV"].iloc[-1] > df["OBV"].rolling(20).mean().iloc[-1]
-        )
-
+        if trend(n) and trend(s):
+            return "STRONG_BULL"
+        elif not trend(n) and not trend(s):
+            return "BEAR"
+        else:
+            return "MIXED"
     except:
-        return False
+        return "UNKNOWN"
+
+def get_macro_state(dxy, oil):
+    try:
+        d = trend(dxy)
+        o = trend(oil)
+        if not d and not o:
+            return "RISK_ON"
+        elif d and o:
+            return "RISK_OFF"
+        else:
+            return "NEUTRAL"
+    except:
+        return "UNKNOWN"
+
+def get_position_cap(macro_state):
+    return {
+        "RISK_ON": 40,
+        "NEUTRAL": 30,
+        "RISK_OFF": 20
+    }.get(macro_state, 25)
 
 # =====================================================
-# RISK CONTROL
+# SCORE ENGINE (UNCHANGED V10.6)
 # =====================================================
 
-def risk(df, entry):
+def score_engine(price, ma10, rsi, dev, bb_up, bb_low, vix, market_state, macro_state):
+    score = 50
 
-    p = df["Close"].iloc[-1]
+    score += 10 if price > ma10 else -10
 
-    if p < df["MA20"].iloc[-1]:
-        return "EXIT"
+    if 50 < rsi < 65:
+        score += 15
+    elif rsi > 75:
+        score -= 20
 
-    if entry > 0 and p < entry * 0.95:
-        return "LIQUIDATE"
+    if dev < -0.05:
+        score += 15
+    elif dev > 0.05:
+        score -= 15
 
-    return "HOLD"
+    if price < bb_low:
+        score += 10
+    elif price > bb_up:
+        score += 5 if market_state == "STRONG_BULL" else -10
 
-# =====================================================
-# STATE MACHINE
-# =====================================================
+    if vix > 25:
+        score *= 0.7
 
-def next_state(s, t, r):
+    if market_state == "BEAR":
+        score -= 15
 
-    if r == "LIQUIDATE":
-        return "FLAT"
+    if macro_state == "RISK_OFF":
+        score -= 10
+    elif macro_state == "RISK_ON":
+        score += 5
 
-    if s == "FLAT" and t:
-        return "ENTRY"
-
-    if s == "ENTRY":
-        return "ADD_1"
-
-    if s == "ADD_1":
-        return "ADD_2"
-
-    if s == "ADD_2":
-        return "FULL"
-
-    return s
+    return max(0, min(100, score))
 
 # =====================================================
-# POSITION
+# ANALYZE (V10.6 + STATE OUTPUT)
 # =====================================================
 
-POS = {
-    "FLAT": 0,
-    "ENTRY": 0.2,
-    "ADD_1": 0.3,
-    "ADD_2": 0.4,
-    "FULL": 1.0
-}
+def analyze(df, vix, market_state, macro_state, cap, state, ticker):
+
+    if df is None or len(df) < 30:
+        return None, state, "FLAT"
+
+    price = df["Close"].iloc[-1]
+    ma10 = df["MA10"].iloc[-1]
+    rsi = df["RSI"].iloc[-1]
+    dev = df["DEV"].iloc[-1]
+    bb_up = df["BB_UPPER"].iloc[-1]
+    bb_low = df["BB_LOWER"].iloc[-1]
+
+    score = score_engine(price, ma10, rsi, dev, bb_up, bb_low, vix, market_state, macro_state)
+
+    # ===== V10.7 STATE MACHINE =====
+    state, pos_state = get_position_state(state, ticker, score)
+
+    pos = min(int(score / 100 * 40), cap)
+    pos = max(pos, int(position_map(pos_state) * cap))
+
+    tag = (
+        "🚀 主升段" if score >= 80 else
+        "🟢 強勢" if score >= 65 else
+        "🟡 可布局" if score >= 50 else
+        "⚠️ 觀望" if score >= 30 else
+        "❌ 風險"
+    )
+
+    return {
+        "price": price,
+        "score": score,
+        "tag": tag,
+        "pos": pos,
+        "cap": cap,
+        "stop": ma10 * 0.95,
+        "rsi": rsi,
+        "bb_up": bb_up,
+        "bb_low": bb_low,
+        "state": pos_state
+    }, state, pos_state
 
 # =====================================================
-# MAIN (V10.6 FORMAT + V10.7 EXTENSION)
+# FORMAT (V10.6 保留 + V10.7 增強)
+# =====================================================
+
+def format_block(name, r):
+    if r is None:
+        return f"\n📊 {name}\n❌ 無資料\n"
+
+    return f"""
+📊 {name}
+🏷️ {r['tag']} ({r['score']:.0f})
+💰 {r['price']:.2f}
+RSI:{r['rsi']:.1f}
+📦 倉位:{r['pos']}%（上限{r['cap']}%）
+🧠 狀態:{r['state']}
+📉 下軌:{r['bb_low']:.2f} | 📈 上軌:{r['bb_up']:.2f}
+🛑 停損:{r['stop']:.2f}
+"""
+
+# =====================================================
+# RUN
 # =====================================================
 
 def run():
 
-    df = fetch()
+    data = get_data()
+    p = {k: add_indicators(v) for k, v in data.items() if v is not None}
 
-    if df is None:
-        print("no data")
-        return
+    market = get_market_state(p.get("NASDAQ"), p.get("SOX"))
+    macro = get_macro_state(p.get("DXY"), p.get("OIL"))
+    cap = get_position_cap(macro)
 
-    df = add_ind(df)
+    vix = p.get("VIX")["Close"].iloc[-1]
 
     state = load_state()
 
-    cap, risk_state = market()
+    assets = ["0050", "00631L", "00662", "00646", "00735", "6770"]
 
-    t = trend(df)
-
-    r = risk(df, state["entry"])
-
-    price = df["Close"].iloc[-1]
-
-    new_state = next_state(state["state"], t, r)
-
-    if state["state"] == "FLAT" and new_state == "ENTRY":
-        state["entry"] = price
-
-    if new_state == "FLAT":
-        state["entry"] = 0
-
-    state["state"] = new_state
+    results = {}
+    for k in assets:
+        res, state, pos_state = analyze(
+            p.get(k),
+            vix,
+            market,
+            macro,
+            cap,
+            state,
+            k
+        )
+        results[k] = res
 
     save_state(state)
 
-    position = POS[new_state] * cap
-
-    # =====================================================
-    # V10.6 FORMAT REPORT (保留原結構)
-    # =====================================================
+    tz = timezone(timedelta(hours=8))
+    now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
 
     msg = f"""
-=============================
-📊 V10.6 MARKET REPORT + V10.7 UPGRADE
-=============================
+📊 V10.7 QUANT REPORT ({now})
 
-🌍 大環境分析
-- Risk State: {risk_state}
-- Risk Cap: {cap}
+🌍 市場：{market}
+🌐 宏觀：{macro}｜倉位上限：{cap}% | VIX:{vix:.1f}
 
-📈 個股分析 (0050.TW)
-- Price: {price:.2f}
-- Trend: {t}
-- Risk Signal: {r}
-
-📊 技術面
-- MA20: {df['MA20'].iloc[-1]:.2f}
-- MA60: {df['MA60'].iloc[-1]:.2f}
-
-🧠 交易狀態 (V10.7 STATE MACHINE)
-- State: {new_state}
-- Entry Price: {state['entry']}
-
-💰 倉位控制
-- Position: {round(position*100,2)}%
-
-📌 訊號說明
-- ENTRY / ADD / FULL 為加碼階段
-- FLAT 為空倉
-=============================
 """
 
-    print(msg)
+    for k in assets:
+        msg += format_block(k, results[k])
 
-    send_telegram(msg)
+    token = os.getenv("BOT_TOKEN")
+    chat_id = os.getenv("CHAT_ID")
+
+    if not token or not chat_id:
+        print(msg)
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    requests.get(url, params={"chat_id": chat_id, "text": msg}, timeout=10)
 
 # =====================================================
 

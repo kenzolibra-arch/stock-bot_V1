@@ -173,6 +173,9 @@ POSITION_MAP = {
 # MAIN (CRON SAFE)
 # =========================
 
+print("TOKEN:", TELEGRAM_TOKEN)
+print("CHAT_ID:", TELEGRAM_CHAT_ID)
+
 def run():
 
     df = fetch_data()

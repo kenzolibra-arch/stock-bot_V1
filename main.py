@@ -3,11 +3,40 @@ import pandas as pd
 import numpy as np
 import json
 import os
+import requests
 
 STATE_FILE = "state.json"
 
 # =========================
-# STATE LOAD / SAVE
+# TELEGRAM (CRON SAFE)
+# =========================
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+def send_telegram(msg):
+
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram not configured")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg,
+        "parse_mode": "HTML"
+    }
+
+    try:
+        r = requests.post(url, data=payload, timeout=10)
+        print("TG:", r.status_code)
+
+    except Exception as e:
+        print("TG ERROR:", e)
+
+# =========================
+# STATE (only persistence)
 # =========================
 
 def load_state():
@@ -26,30 +55,7 @@ def save_state(state):
         json.dump(state, f)
 
 # =========================
-# MARKET DATA (V10.6保留)
-# =========================
-
-def get_risk_cap():
-    try:
-        nasdaq = yf.download("^IXIC", period="3mo", progress=False)
-        vix = yf.download("^VIX", period="1mo", progress=False)
-
-        nasdaq_ma20 = nasdaq["Close"].rolling(20).mean().iloc[-1]
-        nasdaq_price = nasdaq["Close"].iloc[-1]
-        vix_value = vix["Close"].iloc[-1]
-
-        if nasdaq_price > nasdaq_ma20 and vix_value < 20:
-            return 1.0, "RISK_ON"
-        elif vix_value > 25:
-            return 0.3, "RISK_OFF"
-        else:
-            return 0.6, "NEUTRAL"
-
-    except:
-        return 0.5, "UNKNOWN"
-
-# =========================
-# DATA FETCH
+# DATA
 # =========================
 
 def fetch_data():
@@ -81,34 +87,56 @@ def add_indicators(df):
     obv = np.zeros(len(df))
 
     for i in range(1, len(df)):
-        if close[i] > close[i - 1]:
-            obv[i] = obv[i - 1] + volume[i]
-        elif close[i] < close[i - 1]:
-            obv[i] = obv[i - 1] - volume[i]
+        if close[i] > close[i-1]:
+            obv[i] = obv[i-1] + volume[i]
+        elif close[i] < close[i-1]:
+            obv[i] = obv[i-1] - volume[i]
         else:
-            obv[i] = obv[i - 1]
+            obv[i] = obv[i-1]
 
     df["OBV"] = obv
 
     return df
 
 # =========================
-# TREND ENGINE (V10.6保留)
+# MARKET RISK (V10.6保留)
 # =========================
 
-def is_trending_up(df):
+def get_risk_cap():
+    try:
+        nasdaq = yf.download("^IXIC", period="3mo", progress=False)
+        vix = yf.download("^VIX", period="1mo", progress=False)
+
+        if nasdaq.empty or vix.empty:
+            return 0.5, "UNKNOWN"
+
+        if nasdaq["Close"].rolling(20).mean().iloc[-1] < nasdaq["Close"].iloc[-1] and vix["Close"].iloc[-1] < 20:
+            return 1.0, "RISK_ON"
+        elif vix["Close"].iloc[-1] > 25:
+            return 0.3, "RISK_OFF"
+        else:
+            return 0.6, "NEUTRAL"
+
+    except:
+        return 0.5, "UNKNOWN"
+
+# =========================
+# TREND
+# =========================
+
+def is_trending(df):
 
     if df is None or len(df) < 60:
         return False
 
-    close = df["Close"].iloc[-1]
-
     try:
-        cond1 = close > df["MA20"].iloc[-1] > df["MA60"].iloc[-1]
-        cond2 = close > df["High"].rolling(20).max().iloc[-2]
-        cond3 = df["OBV"].iloc[-1] > df["OBV"].rolling(20).mean().iloc[-1]
+        c = df["Close"].iloc[-1]
 
-        return cond1 and cond2 and cond3
+        return (
+            c > df["MA20"].iloc[-1] > df["MA60"].iloc[-1]
+            and c > df["High"].rolling(20).max().iloc[-2]
+            and df["OBV"].iloc[-1] > df["OBV"].rolling(20).mean().iloc[-1]
+        )
 
     except:
         return False
@@ -117,54 +145,20 @@ def is_trending_up(df):
 # RISK CONTROL
 # =========================
 
-def risk_control(df, entry_price):
+def risk_control(df, entry):
 
     price = df["Close"].iloc[-1]
 
     if price < df["MA20"].iloc[-1]:
-        return "STOP"
-
-    if entry_price > 0 and price < entry_price * 0.95:
         return "EXIT"
+
+    if entry > 0 and price < entry * 0.95:
+        return "LIQUIDATE"
 
     return "HOLD"
 
 # =========================
-# STATE MACHINE (V10.7核心)
-# =========================
-
-def next_state(current_state, trend, risk_signal):
-
-    # EXIT優先
-    if risk_signal == "EXIT":
-        return "FLAT"
-
-    if risk_signal == "STOP":
-        return current_state
-
-    # ===== STATE TRANSITION =====
-
-    if current_state == "FLAT":
-        if trend:
-            return "ENTRY"
-        return "FLAT"
-
-    if current_state == "ENTRY":
-        return "ADD_1"
-
-    if current_state == "ADD_1":
-        return "ADD_2"
-
-    if current_state == "ADD_2":
-        return "FULL"
-
-    if current_state == "FULL":
-        return "FULL"
-
-    return "FLAT"
-
-# =========================
-# POSITION SIZE (保留V10.6)
+# POSITION MAP
 # =========================
 
 POSITION_MAP = {
@@ -176,7 +170,7 @@ POSITION_MAP = {
 }
 
 # =========================
-# MAIN
+# MAIN (CRON SAFE)
 # =========================
 
 def run():
@@ -184,7 +178,7 @@ def run():
     df = fetch_data()
 
     if df is None:
-        print("❌ No data")
+        print("No data")
         return
 
     df = add_indicators(df)
@@ -193,46 +187,65 @@ def run():
 
     risk_cap, risk_status = get_risk_cap()
 
-    trend = is_trending_up(df)
+    trend = is_trending(df)
 
     risk_signal = risk_control(df, state["entry_price"])
 
     price = df["Close"].iloc[-1]
 
     # =========================
-    # STATE MACHINE UPDATE
+    # STATE UPDATE (safe)
     # =========================
 
-    new_state = next_state(state["position_state"], trend, risk_signal)
+    new_state = state["position_state"]
 
-    # entry price handling
-    if state["position_state"] == "FLAT" and new_state == "ENTRY":
-        state["entry_price"] = price
+    if risk_signal == "LIQUIDATE":
+        new_state = "FLAT"
 
+    elif state["position_state"] == "FLAT" and trend:
+        new_state = "ENTRY"
+
+    elif state["position_state"] == "ENTRY":
+        new_state = "ADD_1"
+
+    elif state["position_state"] == "ADD_1":
+        new_state = "ADD_2"
+
+    elif state["position_state"] == "ADD_2":
+        new_state = "FULL"
+
+    # update state
     if new_state == "FLAT":
         state["entry_price"] = 0
         state["last_add_price"] = 0
-
-    if new_state in ["ADD_1", "ADD_2"]:
-        state["last_add_price"] = price
+    elif state["position_state"] == "FLAT" and new_state == "ENTRY":
+        state["entry_price"] = price
 
     state["position_state"] = new_state
 
     save_state(state)
 
-    # =========================
-    # OUTPUT
-    # =========================
-
     position = POSITION_MAP[new_state] * risk_cap
 
-    print("===== V10.7 STATE MACHINE =====")
-    print(f"Price: {price:.2f}")
-    print(f"Risk: {risk_status} ({risk_cap})")
-    print(f"Trend: {trend}")
-    print(f"State: {new_state}")
-    print(f"Action: {risk_signal}")
-    print(f"Position: {round(position*100,2)}%")
+    # =========================
+    # CRON OUTPUT (ONLY ONCE)
+    # =========================
+
+    msg = f"""
+📊 V10.7 CRON REPORT
+
+Price: {price:.2f}
+State: {new_state}
+Trend: {trend}
+Risk: {risk_status}
+
+Position: {round(position*100,2)}%
+Signal: {risk_signal}
+"""
+
+    print(msg)
+
+    send_telegram(msg)
 
 # =========================
 
